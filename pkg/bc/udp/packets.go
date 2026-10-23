@@ -170,7 +170,8 @@ func Decode(b []byte) (Packet, error) {
 			PacketID:        le.Uint32(b[16:]),
 			RecvBytesPerSec: le.Uint32(b[20:]),
 		}
-		if le.Uint32(b[8:]) != 0 || (a.GroupID != 0 && a.GroupID != NoAck) {
+		// group and packet id are either both NoAck or an id in group 0
+		if le.Uint32(b[8:]) != 0 || (a.GroupID != 0 && a.GroupID != NoAck) || (a.GroupID == NoAck) != (a.PacketID == NoAck) {
 			return nil, ErrFormat
 		}
 		size := le.Uint32(b[24:])

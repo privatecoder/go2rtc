@@ -52,11 +52,10 @@ type LoginNet struct {
 
 // DeviceInfo is deliberately lenient: the real element has dozens of fields.
 type DeviceInfo struct {
-	Version     string      `xml:"version,attr,omitempty"`
-	Type        string      `xml:"type,omitempty"`        // ipc, nvr...
-	TypeInfo    string      `xml:"typeInfo,omitempty"`    // model class
-	FirmVersion string      `xml:"firmVersion,omitempty"` // often zeros, not the real firmware
-	Resolution  *Resolution `xml:"resolution,omitempty"`  // absent on floodlights
+	Version    string      `xml:"version,attr,omitempty"`
+	Type       string      `xml:"type,omitempty"`       // ipc, nvr...
+	TypeInfo   string      `xml:"typeInfo,omitempty"`   // model class
+	Resolution *Resolution `xml:"resolution,omitempty"` // absent on floodlights
 }
 
 type Resolution struct {
@@ -159,17 +158,15 @@ func marshalXML(v any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// describe is a line for the log: the device type, firmware if the camera
-// reports a real one, and the main resolution.
+// describe is a line for the log: the device type and the main resolution. The
+// login reply has a firmVersion field too, but it holds junk on the cameras we
+// saw (zeros, or numbers that are no version), so it is not used.
 func (d *DeviceInfo) describe() string {
 	var parts []string
 	if d.TypeInfo != "" {
 		parts = append(parts, d.TypeInfo)
 	} else if d.Type != "" {
 		parts = append(parts, d.Type)
-	}
-	if fw := strings.Trim(d.FirmVersion, "0"); fw != "" {
-		parts = append(parts, "firmware "+d.FirmVersion)
 	}
 	if d.Resolution != nil {
 		parts = append(parts, fmt.Sprintf("%dx%d", d.Resolution.Width, d.Resolution.Height))

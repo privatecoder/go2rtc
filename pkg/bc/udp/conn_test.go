@@ -437,8 +437,13 @@ func TestConnPeerTerminate(t *testing.T) {
 	_, err := c.Read(make([]byte, 1))
 	require.ErrorIs(t, err, ErrPeerClosed)
 
-	c2, cam2 := newPair(t, fastCfg())
-	cam2.send(&Discovery{TID: 9, XML: &R2cDisc{SID: 1}})
+	cfg := fastCfg()
+	cfg.SID = 7
+	c2, cam2 := newPair(t, cfg)
+	cam2.send(&Discovery{TID: 9, XML: &R2cDisc{SID: 1}}) // another session
+	time.Sleep(30 * time.Millisecond)
+	require.Equal(t, 1, c2.Stats().Stale)
+	cam2.send(&Discovery{TID: 9, XML: &R2cDisc{SID: 7}})
 	_, err = c2.Read(make([]byte, 1))
 	require.ErrorIs(t, err, ErrRelayEnded)
 }

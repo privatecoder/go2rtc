@@ -27,6 +27,7 @@ type sock struct {
 
 	handler  atomic.Pointer[func([]byte, netip.AddrPort)]
 	rebound  atomic.Pointer[func()]
+	sendHook atomic.Pointer[func([]byte, netip.AddrPort) error] // tests: replaces the write
 	rebinds  atomic.Int64
 	lastBind time.Time
 
@@ -102,6 +103,9 @@ func (s *sock) readLoop() {
 
 // send writes a datagram. A stall over 250 ms or an error rebinds the socket.
 func (s *sock) send(b []byte, to netip.AddrPort) error {
+	if h := s.sendHook.Load(); h != nil {
+		return (*h)(b, to)
+	}
 	pc := s.conn()
 	_ = pc.SetWriteDeadline(time.Now().Add(sendStall))
 	_, err := pc.WriteToUDPAddrPort(b, to)

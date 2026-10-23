@@ -154,24 +154,30 @@ var state struct {
 	cooldown map[string]*cooldown
 }
 
-func cacheGet(uid string) (lookupInfo, bool) {
+// cacheKey is the camera and the lookup policy (the servers that are asked,
+// which the region selects): a lookup made under another policy is not reused.
+func cacheKey(uid string, o *Options) string {
+	return uid + "|" + strings.Join(o.LookupHosts, ",")
+}
+
+func cacheGet(key string) (lookupInfo, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	c, ok := state.lookups[uid]
+	c, ok := state.lookups[key]
 	if !ok || time.Since(c.at) > lookupCacheTTL {
-		delete(state.lookups, uid)
+		delete(state.lookups, key)
 		return lookupInfo{}, false
 	}
 	return c.lk, true
 }
 
-func cachePut(uid string, lk lookupInfo) {
+func cachePut(key string, lk lookupInfo) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.lookups == nil {
 		state.lookups = map[string]cachedLookup{}
 	}
-	state.lookups[uid] = cachedLookup{lk, time.Now()}
+	state.lookups[key] = cachedLookup{lk, time.Now()}
 }
 
 // cooldownWait is how long the next attempt for the uid has to wait. The
@@ -229,6 +235,7 @@ type found struct {
 	sess *session
 	peer netip.AddrPort
 	did  int32
+	sid  uint32 // the relay session, 0 on the LAN
 	path string // local, map, relay: what the media path is
 }
 
@@ -240,6 +247,7 @@ func Discover(ctx context.Context, uid string, opts Options) (*Conn, error) {
 	opts.setDefaults()
 	o := &opts
 
+	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -253,6 +261,7 @@ func Discover(ctx context.Context, uid string, opts Options) (*Conn, error) {
 	}
 	out := make(chan outcome, 2)
 	paths := 0
+	var counted atomic.Bool // this call already added to the cooldown
 
 	// LAN
 	paths++
@@ -273,7 +282,7 @@ func Discover(ctx context.Context, uid string, opts Options) (*Conn, error) {
 	if wantRemote {
 		paths++
 		go func() {
-			s, reg, err := registerLoop(ctx, uid, o)
+			s, reg, err := registerLoop(ctx, uid, o, &counted)
 			if err != nil {
 				out <- outcome{err: err}
 				return
@@ -282,6 +291,7 @@ func Discover(ctx context.Context, uid string, opts Options) (*Conn, error) {
 			if err != nil {
 				s.close()
 				if ctx.Err() == nil {
+					counted.Store(true)
 					cooldownFail(uid, o)
 				}
 			}
@@ -310,10 +320,16 @@ func Discover(ctx context.Context, uid string, opts Options) (*Conn, error) {
 	}
 
 	if winner == nil {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+		err := parent.Err()
+		if err == nil {
+			err = fmt.Errorf("udp: camera %s not reachable: %w", uid, errors.Join(errs...))
 		}
-		return nil, fmt.Errorf("udp: camera %s not reachable: %w", uid, errors.Join(errs...))
+		// running out of time is a failed attempt like any other and counts for
+		// the cooldown (once per call); only a cancel by the caller is exempt
+		if !errors.Is(err, context.Canceled) && !counted.Load() && o.Method != MethodLocal {
+			cooldownFail(uid, o)
+		}
+		return nil, err
 	}
 
 	cooldownReset(uid)
@@ -325,15 +341,19 @@ func Discover(ctx context.Context, uid string, opts Options) (*Conn, error) {
 	default:
 		o.Log.Infof("media path: direct to the camera at %s", winner.peer)
 	}
-	return newConn(winner.sess.sock, true, winner.peer, winner.sess.cid, winner.did, o.Conn), nil
+	cc := o.Conn
+	cc.SID = winner.sid
+	return newConn(winner.sess.sock, true, winner.peer, winner.sess.cid, winner.did, cc), nil
 }
 
 // registerLoop registers with the Reolink servers, again and again with a
 // growing delay: the servers only learn about a new connection attempt lazily
 // and the first tries fail.
-func registerLoop(ctx context.Context, uid string, o *Options) (*session, *regResult, error) {
+func registerLoop(ctx context.Context, uid string, o *Options, counted *atomic.Bool) (*session, *regResult, error) {
 	for {
-		if wait := cooldownWait(uid); wait > 0 {
+		// the cooldown is looked at again after every wait: another call for the
+		// same camera may have extended it meanwhile
+		for wait := cooldownWait(uid); wait > 0; wait = cooldownWait(uid) {
 			o.Log.Debugf("waiting %s before contacting the Reolink servers again", wait.Round(time.Millisecond))
 			select {
 			case <-time.After(wait):
@@ -354,6 +374,7 @@ func registerLoop(ctx context.Context, uid string, o *Options) (*session, *regRe
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
+		counted.Store(true)
 		wait := cooldownFail(uid, o)
 		o.Log.Warnf("registration failed (%v), retrying in %s", err, wait)
 	}
@@ -375,8 +396,7 @@ type session struct {
 	subs     map[uint32]chan reply // by tid
 	handlers map[chan reply]struct{}
 
-	sem chan struct{} // one path at a time may complete
-	won atomic.Bool
+	won atomic.Bool // a path has been chosen
 }
 
 func newSession(o *Options) (*session, error) {
@@ -387,7 +407,6 @@ func newSession(o *Options) (*session, error) {
 	s := &session{
 		o: o, sock: sk, cid: int32(rand.Uint32()),
 		subs: map[uint32]chan reply{}, handlers: map[chan reply]struct{}{},
-		sem: make(chan struct{}, 1),
 	}
 	sk.setHandler(s.onPacket)
 	return s, nil
@@ -395,8 +414,11 @@ func newSession(o *Options) (*session, error) {
 
 func (s *session) close() { _ = s.sock.Close() }
 
-// onPacket routes a discovery reply to whoever waits for its tid, or to all
-// listeners if nobody does. Everything else is not for the handshake.
+// onPacket routes a discovery message. A request gets the messages with its
+// tid; offers and confirmations also go to the listeners, because the tid
+// space is small (one byte in practice) and an unrelated request may use the
+// tid of a message from the camera. Everything nobody subscribed to goes to
+// the listeners.
 func (s *session) onPacket(b []byte, from netip.AddrPort) {
 	p, err := Decode(b)
 	if err != nil {
@@ -409,11 +431,17 @@ func (s *session) onPacket(b []byte, from netip.AddrPort) {
 
 	s.mu.Lock()
 	var to []chan reply
-	if ch := s.subs[d.TID]; ch != nil && d.TID > 0 {
+	ch := s.subs[d.TID]
+	if ch != nil && d.TID > 0 {
 		to = append(to, ch)
-	} else {
-		for ch := range s.handlers {
-			to = append(to, ch)
+	}
+	switch d.XML.(type) {
+	case *D2cT, *D2cCfm:
+		ch = nil // a waiter may not be able to use it
+	}
+	if ch == nil || d.TID == 0 {
+		for l := range s.handlers {
+			to = append(to, l)
 		}
 	}
 	s.mu.Unlock()
@@ -426,20 +454,17 @@ func (s *session) onPacket(b []byte, from netip.AddrPort) {
 	}
 }
 
-func (s *session) newTID() uint32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for {
-		tid := uint32(rand.IntN(255) + 1)
-		if s.subs[tid] == nil {
-			return tid
-		}
-	}
-}
+// randTID is a tid for a message nobody answers.
+func randTID() uint32 { return uint32(rand.IntN(255) + 1) }
 
+// subscribe takes a tid the caller was given (the camera's, for an accept).
 func (s *session) subscribe(tid uint32) (ch chan reply, unsub func(), err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.subscribeLocked(tid)
+}
+
+func (s *session) subscribeLocked(tid uint32) (ch chan reply, unsub func(), err error) {
 	if s.subs[tid] != nil {
 		return nil, nil, fmt.Errorf("udp: tid %d is already in use", tid)
 	}
@@ -454,9 +479,24 @@ func (s *session) subscribe(tid uint32) (ch chan reply, unsub func(), err error)
 	}, nil
 }
 
+// subscribeNew picks a free tid and reserves it in one step. The tries are
+// bounded, an exhausted space is an error and not a loop under the mutex.
+func (s *session) subscribeNew() (tid uint32, ch chan reply, unsub func(), err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for try := 0; try < 1024; try++ {
+		tid = randTID()
+		if s.subs[tid] == nil {
+			ch, unsub, err = s.subscribeLocked(tid)
+			return
+		}
+	}
+	return 0, nil, nil, errors.New("udp: no free tid")
+}
+
 // listen receives all discovery traffic nobody subscribed to.
 func (s *session) listen() (ch chan reply, unlisten func()) {
-	ch = make(chan reply, 32)
+	ch = make(chan reply, 128)
 	s.mu.Lock()
 	s.handlers[ch] = struct{}{}
 	s.mu.Unlock()
@@ -478,10 +518,14 @@ func (s *session) send(d *Discovery, to netip.AddrPort) {
 // count too (the camera answers an accept under its own tid).
 func request[T any](ctx context.Context, s *session, d *Discovery, to netip.AddrPort, anyTid bool, match func(*Discovery, netip.AddrPort) (T, bool)) (T, error) {
 	var zero T
+	var ch chan reply
+	var unsub func()
+	var err error
 	if d.TID == 0 {
-		d.TID = s.newTID()
+		d.TID, ch, unsub, err = s.subscribeNew()
+	} else {
+		ch, unsub, err = s.subscribe(d.TID)
 	}
-	ch, unsub, err := s.subscribe(d.TID)
 	if err != nil {
 		return zero, err
 	}
@@ -532,6 +576,7 @@ func ctxErr(ctx context.Context) error {
 var (
 	ErrNoReply       = errors.New("no reply")
 	ErrRegisterFail  = errors.New("udp: the register server refused")
+	ErrConfirmFailed = errors.New("udp: the camera refused the connection")
 	errPathCompleted = errors.New("udp: another path already completed")
 )
 
@@ -633,16 +678,16 @@ func (s *session) registerAddress(ctx context.Context, uid string, lk lookupInfo
 		if !ok {
 			return reg{}, false
 		}
-		any := r.Dev.Valid() || r.Dmap.Valid() || r.Relay.Valid()
-		switch {
-		case any && r.SID != nil && r.Rsp != -1 && r.Rsp != -3:
+		// a refusal is a refusal with or without addresses
+		if r.Rsp == -1 || r.Rsp == -3 {
+			return reg{err: ErrRegisterFail}, true
+		}
+		if (r.Dev.Valid() || r.Dmap.Valid() || r.Relay.Valid()) && r.SID != nil {
 			res := &regResult{reg: lk.reg, sid: *r.SID}
 			res.dev, _ = r.Dev.Addr()
 			res.dmap, _ = r.Dmap.Addr()
 			res.relay, _ = r.Relay.Addr()
 			return reg{r: res}, true
-		case any && (r.Rsp == -1 || r.Rsp == -3):
-			return reg{err: ErrRegisterFail}, true
 		}
 		return reg{}, false
 	})
@@ -657,7 +702,7 @@ func (s *session) registerAddress(ctx context.Context, uid string, lk lookupInfo
 // register server; the first registration that works wins.
 func (s *session) getRegistration(ctx context.Context, uid string) (*regResult, error) {
 	if !s.o.NoCache {
-		if lk, ok := cacheGet(uid); ok {
+		if lk, ok := cacheGet(cacheKey(uid, s.o)); ok {
 			s.o.Log.Debugf("using cached lookup for %s", uid)
 			if r, err := s.registerAddress(ctx, uid, lk); err == nil {
 				return r, nil
@@ -719,7 +764,7 @@ func (s *session) getRegistration(ctx context.Context, uid string) (*regResult, 
 			continue
 		}
 		if !s.o.NoCache {
-			cachePut(uid, r.lk)
+			cachePut(cacheKey(uid, s.o), r.lk)
 		}
 		s.o.Log.Debugf("registered with %s (relay %s)", r.lk.reg, r.lk.relay)
 		return r.r, nil
@@ -807,34 +852,38 @@ func (s *session) race(ctx context.Context, reg *regResult, remote, mapp, relay 
 	return nil, errors.Join(errs...)
 }
 
-func (s *session) acquire(ctx context.Context) error {
-	select {
-	case s.sem <- struct{}{}:
-		if s.won.Load() {
-			<-s.sem
-			return errPathCompleted
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+// complete is the common end of every path, called when the path is fully
+// confirmed. Only this step is exclusive: the first confirmed path becomes the
+// result at once (nothing waits behind a path that is still negotiating) and
+// the register server is told which path it was (several times, UDP).
+func (s *session) complete(reg *regResult, conn string, peer netip.AddrPort, did int32) (*found, error) {
+	if !s.won.CompareAndSwap(false, true) {
+		return nil, errPathCompleted
 	}
-}
-
-func (s *session) release() { <-s.sem }
-
-// complete is the common end of every path: tell the register server which
-// path was established (several times, UDP) and give the result.
-func (s *session) complete(reg *regResult, conn string, peer netip.AddrPort, did int32) *found {
-	s.won.Store(true)
 	go func() {
 		for i := 0; i < cfmRepeats; i++ {
 			if i > 0 {
 				time.Sleep(s.o.ResendWait)
 			}
-			s.send(&Discovery{TID: s.newTID(), XML: &C2rCfm{SID: reg.sid, Conn: conn, CID: s.cid, DID: did}}, reg.reg)
+			s.send(&Discovery{TID: randTID(), XML: &C2rCfm{SID: reg.sid, Conn: conn, CID: s.cid, DID: did}}, reg.reg)
 		}
 	}()
-	return &found{sess: s, peer: peer, did: did, path: conn}
+	return &found{sess: s, peer: peer, did: did, sid: reg.sid, path: conn}, nil
+}
+
+// confirmation is a D2C_CFM that belongs to a request.
+type confirmation struct {
+	from netip.AddrPort
+	did  int32
+	rsp  int32
+}
+
+// check turns a confirmation into success or the camera's refusal.
+func (c confirmation) check(conn string) error {
+	if c.rsp != 0 {
+		return fmt.Errorf("%w (%s, rsp %d)", ErrConfirmFailed, conn, c.rsp)
+	}
+	return nil
 }
 
 // remote races the two ways to the camera's LAN address: we ask it, or it
@@ -867,24 +916,19 @@ func (s *session) clientInitiatedDev(ctx context.Context, reg *regResult) (*foun
 		return nil, errors.New("no device address")
 	}
 	msg := &Discovery{XML: &C2dT{SID: reg.sid, Conn: "local", CID: s.cid, MTU: MTU}}
-	type cfm struct {
-		from netip.AddrPort
-		did  int32
-	}
-	r, err := request(ctx, s, msg, reg.dev, false, func(d *Discovery, from netip.AddrPort) (cfm, bool) {
-		if m, ok := d.XML.(*D2cCfm); ok && m.CID == s.cid && m.SID == reg.sid {
-			return cfm{from, m.DID}, true
+	r, err := request(ctx, s, msg, reg.dev, false, func(d *Discovery, from netip.AddrPort) (confirmation, bool) {
+		if m, ok := d.XML.(*D2cCfm); ok && m.CID == s.cid && m.SID == reg.sid && m.Conn == "local" {
+			return confirmation{from, m.DID, m.Rsp}, true
 		}
-		return cfm{}, false
+		return confirmation{}, false
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err = s.acquire(ctx); err != nil {
+	if err = r.check("local"); err != nil {
 		return nil, err
 	}
-	defer s.release()
-	return s.complete(reg, "local", r.from, r.did), nil
+	return s.complete(reg, "local", r.from, r.did)
 }
 
 // accept waits for the camera to offer a connection (D2C_T) matching ok,
@@ -906,20 +950,21 @@ wait:
 		}
 	}
 
-	if err := s.acquire(ctx); err != nil {
-		return nil, err
-	}
-	defer s.release()
-
 	msg := &Discovery{TID: tid, XML: &C2dA{SID: reg.sid, Conn: conn, CID: s.cid, DID: offer.DID, MTU: MTU}}
-	_, err := request(ctx, s, msg, from, true, func(d *Discovery, _ netip.AddrPort) (struct{}, bool) {
+	r, err := request(ctx, s, msg, from, true, func(d *Discovery, _ netip.AddrPort) (confirmation, bool) {
 		m, isCfm := d.XML.(*D2cCfm)
-		return struct{}{}, isCfm && m.SID == reg.sid && m.DID == offer.DID && m.CID == s.cid && m.Conn == conn
+		if isCfm && m.SID == reg.sid && m.DID == offer.DID && m.CID == s.cid && m.Conn == conn {
+			return confirmation{from, m.DID, m.Rsp}, true
+		}
+		return confirmation{}, false
 	})
 	if err != nil {
 		return nil, err
 	}
-	return s.complete(reg, conn, from, offer.DID), nil
+	if err = r.check(conn); err != nil {
+		return nil, err
+	}
+	return s.complete(reg, conn, from, offer.DID)
 }
 
 func (s *session) deviceInitiatedDev(ctx context.Context, reg *regResult) (*found, error) {
@@ -947,7 +992,7 @@ func (s *session) deviceInitiatedMap(ctx context.Context, reg *regResult, timeou
 			tk := time.NewTicker(s.o.ResendWait)
 			defer tk.Stop()
 			for i := 0; i < 5; i++ {
-				s.send(&Discovery{TID: s.newTID(), XML: &C2dT{SID: reg.sid, Conn: "map", CID: s.cid, MTU: MTU}}, reg.dmap)
+				s.send(&Discovery{TID: randTID(), XML: &C2dT{SID: reg.sid, Conn: "map", CID: s.cid, MTU: MTU}}, reg.dmap)
 				select {
 				case <-tk.C:
 				case <-ctx.Done():
@@ -973,26 +1018,20 @@ func (s *session) clientInitiatedRelay(ctx context.Context, reg *regResult) (*fo
 	if !reg.relay.IsValid() {
 		return nil, errors.New("no relay address")
 	}
-	if err := s.acquire(ctx); err != nil {
-		return nil, err
-	}
-	defer s.release()
-
 	msg := &Discovery{XML: &C2dT{SID: reg.sid, Conn: "relay", CID: s.cid, MTU: MTU}}
-	type cfm struct {
-		from netip.AddrPort
-		did  int32
-	}
-	r, err := request(ctx, s, msg, reg.relay, false, func(d *Discovery, from netip.AddrPort) (cfm, bool) {
+	r, err := request(ctx, s, msg, reg.relay, false, func(d *Discovery, from netip.AddrPort) (confirmation, bool) {
 		if m, ok := d.XML.(*D2cCfm); ok && m.CID == s.cid && m.SID == reg.sid && m.Conn == "relay" {
-			return cfm{from, m.DID}, true
+			return confirmation{from, m.DID, m.Rsp}, true
 		}
-		return cfm{}, false
+		return confirmation{}, false
 	})
 	if err != nil {
 		return nil, err
 	}
-	return s.complete(reg, "relay", r.from, r.did), nil
+	if err = r.check("relay"); err != nil {
+		return nil, err
+	}
+	return s.complete(reg, "relay", r.from, r.did)
 }
 
 // relayAssisted prefers a direct path: the hole punch gets MapTimeout, the

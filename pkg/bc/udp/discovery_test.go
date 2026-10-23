@@ -110,12 +110,17 @@ type cloud struct {
 	sid uint32
 	did int32
 
-	mapOffers  atomic.Bool // the camera answers hole punches
-	lanAnswers atomic.Bool // the camera answers on its LAN address
-	relayWorks atomic.Bool
-	regFails   atomic.Int32 // refuse this many registrations first
-	lookups    atomic.Int32
-	registers  atomic.Int32
+	noDmap      atomic.Bool  // the register server knows no public address
+	refuseEmpty atomic.Bool  // the register server refuses without any address
+	cfmRsp      atomic.Int32 // rsp of every D2C_CFM
+	cfmConn     atomic.Value // string: the conn every D2C_CFM claims, instead of the right one
+	lanDelay    atomic.Int64 // ns the camera takes to answer on its LAN address
+	mapOffers   atomic.Bool  // the camera answers hole punches
+	lanAnswers  atomic.Bool  // the camera answers on its LAN address
+	relayWorks  atomic.Bool
+	regFails    atomic.Int32 // refuse this many registrations first
+	lookups     atomic.Int32
+	registers   atomic.Int32
 }
 
 func newCloud(t *testing.T) *cloud {
@@ -125,7 +130,10 @@ func newCloud(t *testing.T) *cloud {
 	c.relayWorks.Store(true)
 
 	cfm := func(conn string, cid int32) *D2cCfm {
-		return &D2cCfm{SID: c.sid, Conn: conn, CID: cid, DID: c.did, TimeR: new(uint32)}
+		if o, _ := c.cfmConn.Load().(string); o != "" {
+			conn = o
+		}
+		return &D2cCfm{SID: c.sid, Conn: conn, Rsp: c.cfmRsp.Load(), CID: cid, DID: c.did, TimeR: new(uint32)}
 	}
 
 	c.lookup, c.reg, c.relay, c.lan, c.pub = newEndpoint(t), newEndpoint(t), newEndpoint(t), newEndpoint(t), newEndpoint(t)
@@ -143,8 +151,14 @@ func newCloud(t *testing.T) *cloud {
 		}
 		c.registers.Add(1)
 		r := &R2cCr{Dev: ipport(c.lan.addr), Dmap: ipport(c.pub.addr), Relay: ipport(c.relay.addr), NAT: "NULL", SID: &c.sid}
+		if c.noDmap.Load() {
+			r.Dmap = nil
+		}
 		if c.regFails.Add(-1) >= 0 {
 			r.SID, r.Rsp = nil, -3
+		}
+		if c.refuseEmpty.Load() {
+			r = &R2cCr{NAT: "NULL", Rsp: -3}
 		}
 		_ = q
 		e.reply(from, d.TID, r)
@@ -158,7 +172,12 @@ func newCloud(t *testing.T) *cloud {
 			e.reply(from, d.TID, &D2cCr{Timer: Timer{3000, 20000, 60000}, CID: m.CID, DID: c.did})
 		case *C2dT:
 			if m.Conn == "local" {
-				e.reply(from, d.TID, cfm("local", m.CID))
+				reply := cfm("local", m.CID)
+				if delay := time.Duration(c.lanDelay.Load()); delay > 0 {
+					time.AfterFunc(delay, func() { e.reply(from, d.TID, reply) })
+				} else {
+					e.reply(from, d.TID, reply)
+				}
 			}
 		}
 	})
@@ -559,7 +578,7 @@ func TestSessionRoutingByTID(t *testing.T) {
 	require.Len(t, all, 2)
 
 	for i := 0; i < 1000; i++ {
-		require.NotZero(t, s.newTID())
-		require.LessOrEqual(t, s.newTID(), uint32(255))
+		require.NotZero(t, randTID())
+		require.LessOrEqual(t, randTID(), uint32(255))
 	}
 }

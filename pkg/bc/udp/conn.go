@@ -2,6 +2,7 @@ package udp
 
 import (
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -27,7 +28,15 @@ var (
 	ErrPeerClosed = errors.New("udp: camera ended the connection")
 	ErrRelayEnded = errors.New("udp: relay ended the connection")
 	ErrWindow     = errors.New("udp: camera does not acknowledge, send window full")
+	// ErrSequenceLimit ends a connection before its packet ids get near 2^30,
+	// where the wire format switches to a second ACK group and the ids need
+	// extended arithmetic. At a few hundred packets per second that is weeks
+	// away; the caller reconnects long before.
+	ErrSequenceLimit = errors.New("udp: planned reconnect before the packet-id boundary")
 )
+
+// seqLimit is where a connection is ended, 2^30 minus a margin.
+const seqLimit = 1<<30 - 1<<20
 
 // ConnConfig tunes a Conn, zero values are what the official client does.
 type ConnConfig struct {
@@ -39,6 +48,10 @@ type ConnConfig struct {
 	MaxUnacked     int           // sent packets waiting for an ACK before Write blocks, 4096
 	WriteStall     time.Duration // how long Write waits for window space, 10 s
 	RxLimit        int           // bytes received but not read before the oldest are dropped, 16 MiB
+	ReorderLimit   int           // bytes held for packets that arrived ahead of a gap, 8 MiB
+	ResendBatch    int           // packets sent again per maintenance tick, 64
+	SeqLimit       uint32        // packet id (ours or the camera's) that ends the connection, 2^30 - 2^20
+	SID            uint32        // relay session id, for R2C_DISC; 0 on the LAN
 	Log            Logger
 }
 
@@ -60,19 +73,33 @@ func (c *ConnConfig) setDefaults() {
 	if c.RxLimit == 0 {
 		c.RxLimit = 16 << 20
 	}
+	if c.ReorderLimit == 0 {
+		c.ReorderLimit = 8 << 20
+	}
+	if c.ResendBatch == 0 {
+		c.ResendBatch = 64
+	}
+	if c.SeqLimit == 0 {
+		c.SeqLimit = seqLimit
+	}
 	c.Log = c.Log.Filled()
 }
 
 // Stats are counters for diagnostics and tests.
 type Stats struct {
-	Resends     int    // packets sent again
-	GapSkips    int    // times a missing packet was given up on
-	Reordered   int    // packets that arrived ahead of the contiguous point
-	Dropped     int    // received stream bytes dropped because nobody reads
-	RecvRate    uint32 // bytes/s reported to the camera in the ACKs
-	Rebinds     int64  // socket rebinds after a send stall
-	PacketsWant uint32 // next packet awaited
-	Unacked     int    // sent packets without ACK
+	Resends        int    // packets sent again
+	GapSkips       int    // times a missing packet was given up on
+	Reordered      int    // packets that arrived ahead of the contiguous point
+	Dropped        int    // received stream bytes dropped because nobody reads
+	ReorderDropped int    // packets dropped because the reorder buffer was full
+	ProtocolErrors int    // oversized Data, ACKs for packets never sent
+	Stale          int    // traffic of another session, ignored
+	RecvRate       uint32 // bytes/s reported to the camera in the ACKs
+	Rebinds        int64  // socket rebinds after a send stall
+	PacketsWant    uint32 // next packet awaited
+	Unacked        int    // sent packets without ACK
+	Reorder        int    // packets in the reorder buffer
+	ReorderBytes   int    // and their bytes
 }
 
 // Conn is the reliable byte stream to a camera over UDP: the Baichuan bytes
@@ -95,15 +122,17 @@ type Conn struct {
 	err    error
 
 	// sending
-	nextID uint32
-	sent   map[uint32][]byte // encoded packets without ACK
+	nextID  uint32
+	sent    map[uint32][]byte // encoded packets without ACK
+	resendQ []uint32          // ids still to send in the current resend pass
 
 	// receiving
-	want    uint32            // next packet to deliver
-	recvd   map[uint32][]byte // arrived ahead of want
-	gapFrom time.Time         // since when want is missing while later ones are here
-	rx      [][]byte          // delivered, not yet read
-	rxBytes int
+	want       uint32            // next packet to deliver
+	recvd      map[uint32][]byte // arrived ahead of want
+	recvdBytes int
+	gapFrom    time.Time // since when want is missing while later ones are here
+	rx         [][]byte  // delivered, not yet read
+	rxBytes    int
 
 	lastRx time.Time
 
@@ -115,6 +144,7 @@ type Conn struct {
 
 	stats Stats
 
+	logq chan func() // diagnostics run on their own goroutine, a slow sink stalls nothing
 	done chan struct{}
 }
 
@@ -135,6 +165,7 @@ func newConn(s *sock, own bool, peer netip.AddrPort, cid, did int32, cfg ConnCon
 		recvd:    map[uint32][]byte{},
 		lastRx:   now,
 		rateFrom: now,
+		logq:     make(chan func(), 32),
 		done:     make(chan struct{}),
 	}
 	c.cond = sync.NewCond(&c.mu)
@@ -144,7 +175,28 @@ func newConn(s *sock, own bool, peer netip.AddrPort, cid, did int32, cfg ConnCon
 	s.rebound.Store(&rebound)
 
 	go c.run()
+	go c.logLoop()
 	return c
+}
+
+// logAsync queues a diagnostic. It never blocks and is never called with the
+// mutex held; when the sink cannot keep up, messages are dropped.
+func (c *Conn) logAsync(f func()) {
+	select {
+	case c.logq <- f:
+	default:
+	}
+}
+
+func (c *Conn) logLoop() {
+	for {
+		select {
+		case f := <-c.logq:
+			f()
+		case <-c.done:
+			return
+		}
+	}
 }
 
 func (c *Conn) LocalAddr() net.Addr { return c.sock.conn().LocalAddr() }
@@ -157,6 +209,7 @@ func (c *Conn) Stats() Stats {
 	defer c.mu.Unlock()
 	s := c.stats
 	s.RecvRate, s.PacketsWant, s.Unacked = c.rate, c.want, len(c.sent)
+	s.Reorder, s.ReorderBytes = len(c.recvd), c.recvdBytes
 	s.Rebinds = c.sock.rebinds.Load()
 	return s
 }
@@ -216,6 +269,11 @@ func (c *Conn) reserve(chunk []byte) ([]byte, error) {
 			c.mu.Unlock()
 			return nil, err
 		}
+		if c.nextID >= c.cfg.SeqLimit {
+			c.mu.Unlock()
+			c.endForSequence()
+			return nil, ErrSequenceLimit
+		}
 		if len(c.sent) < c.cfg.MaxUnacked {
 			defer c.mu.Unlock()
 			id := c.nextID
@@ -231,6 +289,18 @@ func (c *Conn) reserve(chunk []byte) ([]byte, error) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+}
+
+// endForSequence is the orderly end before the packet ids reach the point
+// where the wire format and our arithmetic stop being the same thing.
+func (c *Conn) endForSequence() {
+	c.mu.Lock()
+	already := c.closed
+	c.mu.Unlock()
+	if !already {
+		c.logAsync(func() { c.cfg.Log.Infof("planned reconnect before the packet-id boundary") })
+	}
+	c.finish(ErrSequenceLimit, true)
 }
 
 // Close ends the connection: a C2D_DISC to the camera (best effort), the
@@ -269,7 +339,9 @@ func (c *Conn) sendHB() {
 	_ = c.sock.send(c.discovery(&C2dHb{CID: c.cid, DID: c.did}), c.peer)
 }
 
-// onPacket runs on the socket's read goroutine.
+// onPacket runs on the socket's read goroutine. Only traffic of this session
+// counts as life: the peer's address is not enough, the same camera or relay
+// endpoint can carry an older or newer session with other ids.
 func (c *Conn) onPacket(b []byte, from netip.AddrPort) {
 	if from != c.peer {
 		return
@@ -279,51 +351,74 @@ func (c *Conn) onPacket(b []byte, from netip.AddrPort) {
 		return
 	}
 
+	var end error
+	var answer bool
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return
 	}
-	c.lastRx = time.Now()
 
 	switch p := p.(type) {
 	case *Discovery:
 		switch m := p.XML.(type) {
 		case *D2cHb:
-			c.mu.Unlock()
-			if m.CID != c.cid || m.DID != c.did {
-				c.cfg.Log.Warnf("camera heartbeat has other ids (cid %d did %d)", m.CID, m.DID)
+			if m.CID == c.cid && m.DID == c.did {
+				c.lastRx, answer = time.Now(), true
+			} else {
+				c.stats.Stale++
 			}
-			c.sendHB() // answer, the camera checks the client lives
-			return
 		case *D2cDisc:
-			c.mu.Unlock()
-			c.finish(ErrPeerClosed, false)
-			return
+			if m.CID == c.cid && m.DID == c.did {
+				end = ErrPeerClosed
+			} else {
+				c.stats.Stale++
+			}
 		case *R2cDisc:
-			c.mu.Unlock()
-			c.finish(ErrRelayEnded, false)
-			return
+			if c.cfg.SID != 0 && m.SID == c.cfg.SID {
+				end = ErrRelayEnded
+			} else {
+				c.stats.Stale++
+			}
 		}
 
 	case *Ack:
-		if p.ConnID == c.cid {
-			c.handleAck(p)
+		if p.ConnID != c.cid {
+			c.stats.Stale++
+		} else if c.handleAck(p) {
+			c.lastRx = time.Now()
 		}
 
 	case *Data:
-		if p.ConnID == c.cid {
-			c.handleData(p)
+		if p.ConnID != c.cid {
+			c.stats.Stale++
+		} else {
+			end = c.handleData(p)
 		}
 	}
 	c.mu.Unlock()
+
+	if answer {
+		c.sendHB() // the camera checks the client lives
+	}
+	if end == ErrSequenceLimit {
+		c.endForSequence()
+	} else if end != nil {
+		c.finish(end, false)
+	}
 }
 
 // handleAck drops what the camera has: everything up to PacketID and what the
-// selective map marks as received.
-func (c *Conn) handleAck(a *Ack) {
+// selective map marks as received. An ACK for packets we never sent is not
+// believed and not counted as life.
+func (c *Conn) handleAck(a *Ack) bool {
 	if a.PacketID == NoAck {
-		return
+		return true // nothing acknowledged yet, still the camera
+	}
+	if a.PacketID >= c.nextID {
+		c.stats.ProtocolErrors++
+		return false
 	}
 	for id := range c.sent {
 		if id <= a.PacketID {
@@ -331,31 +426,54 @@ func (c *Conn) handleAck(a *Ack) {
 		}
 	}
 	for i, got := range a.Payload {
-		if got > 0 {
-			delete(c.sent, a.PacketID+1+uint32(i))
+		if id := a.PacketID + 1 + uint32(i); got > 0 && id < c.nextID {
+			delete(c.sent, id)
 		}
 	}
+	return true
 }
 
-func (c *Conn) handleData(d *Data) {
+// handleData stores a packet. It returns ErrSequenceLimit when the ids come
+// near the boundary the transport does not go beyond.
+func (c *Conn) handleData(d *Data) error {
+	if len(d.Payload) > MaxPayload {
+		c.stats.ProtocolErrors++ // the negotiated MTU is a limit, not a hint
+		return nil
+	}
+	c.lastRx = time.Now()
 	c.rateBytes += uint64(len(d.Payload))
 
+	if d.PacketID >= c.cfg.SeqLimit {
+		return ErrSequenceLimit
+	}
 	if d.PacketID < c.want {
-		return // already delivered, a resend that crossed our ACK
+		return nil // already delivered, a resend that crossed our ACK
 	}
 	if d.PacketID > c.want {
 		c.stats.Reordered++
 		if d.PacketID-c.want > 1<<14 {
-			return // far beyond any window, not worth the memory
+			return nil // far beyond any window, not worth the memory
 		}
 	}
-	if _, dup := c.recvd[d.PacketID]; !dup {
-		c.recvd[d.PacketID] = d.Payload
+	if _, dup := c.recvd[d.PacketID]; dup {
+		return nil
 	}
+	if d.PacketID != c.want && c.recvdBytes+len(d.Payload) > c.cfg.ReorderLimit {
+		c.stats.ReorderDropped++ // the camera sends it again
+		return nil
+	}
+	c.recvd[d.PacketID] = d.Payload
+	c.recvdBytes += len(d.Payload)
 	c.deliver()
+
+	if c.want >= c.cfg.SeqLimit {
+		return ErrSequenceLimit
+	}
+	return nil
 }
 
-// deliver moves the contiguous packets to the read queue.
+// deliver moves the contiguous packets to the read queue. Empty packets
+// advance the stream and are acknowledged but add nothing to read.
 func (c *Conn) deliver() {
 	var moved bool
 	for {
@@ -364,10 +482,14 @@ func (c *Conn) deliver() {
 			break
 		}
 		delete(c.recvd, c.want)
+		c.recvdBytes -= len(payload)
 		c.want++
+		moved = true
+		if len(payload) == 0 {
+			continue
+		}
 		c.rx = append(c.rx, payload)
 		c.rxBytes += len(payload)
-		moved = true
 	}
 
 	if moved {
@@ -386,19 +508,21 @@ func (c *Conn) deliver() {
 }
 
 // skipGap gives up on missing packets once they were due for too long: the
-// stream gets a hole (one damaged message above) and carries on.
-func (c *Conn) skipGap(now time.Time) {
+// stream gets a hole (one damaged message above) and carries on. It returns
+// the diagnostic to log after the mutex is released.
+func (c *Conn) skipGap(now time.Time) (msg string) {
 	if len(c.recvd) == 0 || c.gapFrom.IsZero() || now.Sub(c.gapFrom) < c.cfg.GapSkip {
-		return
+		return ""
 	}
 	next := slices.Min(mapKeys(c.recvd))
 	if next > c.want {
-		c.cfg.Log.Warnf("lost packets %d..%d skipped after %s", c.want, next-1, now.Sub(c.gapFrom).Round(time.Millisecond))
+		msg = fmt.Sprintf("lost packets %d..%d skipped after %s", c.want, next-1, now.Sub(c.gapFrom).Round(time.Millisecond))
 		c.want = next
 		c.stats.GapSkips++
 	}
 	c.gapFrom = time.Time{}
 	c.deliver()
+	return msg
 }
 
 func mapKeys(m map[uint32][]byte) []uint32 {
@@ -443,6 +567,30 @@ func (c *Conn) latchRate(now time.Time) {
 	c.rateBytes, c.rateFrom = 0, now
 }
 
+// resendSome sends packets of the current resend pass again, at most
+// ResendBatch of them and not for longer than one ACK interval, so that a
+// pass over thousands of packets (or a stalled socket) never holds up the
+// ACKs, the heartbeat and the timeout check.
+func (c *Conn) resendSome(start time.Time) {
+	for n := 0; n < c.cfg.ResendBatch && time.Since(start) < c.cfg.AckInterval; n++ {
+		c.mu.Lock()
+		var wire []byte
+		for len(c.resendQ) > 0 && wire == nil {
+			id := c.resendQ[0]
+			c.resendQ = c.resendQ[1:]
+			if w, ok := c.sent[id]; ok { // not acknowledged meanwhile
+				wire = w
+				c.stats.Resends++
+			}
+		}
+		c.mu.Unlock()
+		if wire == nil {
+			return
+		}
+		_ = c.sock.send(wire, c.peer)
+	}
+}
+
 // run drives everything on a clock: ACKs, resends, heartbeat, gap skipping,
 // the receive rate and the silence timeout.
 func (c *Conn) run() {
@@ -467,28 +615,30 @@ func (c *Conn) run() {
 				c.finish(ErrTimeout, false)
 				return
 			}
+			limit := c.want >= c.cfg.SeqLimit || c.nextID >= c.cfg.SeqLimit
 
 			c.latchRate(now)
-			c.skipGap(now)
+			gap := c.skipGap(now)
 			ack := c.buildAck()
 
-			var resend [][]byte
-			if now.Sub(lastResend) >= c.cfg.ResendInterval {
+			if len(c.resendQ) == 0 && now.Sub(lastResend) >= c.cfg.ResendInterval {
 				lastResend = now
-				ids := mapKeys(c.sent)
-				slices.Sort(ids)
-				for _, id := range ids {
-					resend = append(resend, c.sent[id])
-				}
-				c.stats.Resends += len(resend)
+				c.resendQ = mapKeys(c.sent)
+				slices.Sort(c.resendQ)
 			}
 			c.mu.Unlock()
 
+			if limit {
+				c.endForSequence()
+				return
+			}
+			if gap != "" {
+				c.logAsync(func() { c.cfg.Log.Warnf("%s", gap) })
+			}
+
 			wire, _ := ack.Marshal()
 			_ = c.sock.send(wire, c.peer)
-			for _, w := range resend {
-				_ = c.sock.send(w, c.peer)
-			}
+			c.resendSome(now)
 
 			if now.Sub(lastHB) >= c.cfg.HBInterval {
 				lastHB = now
