@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -86,9 +85,9 @@ type Producer struct {
 	based  bool
 	baseUS uint64 // where this producer's camera clock starts on the process timeline
 
-	talkCfg *TalkConfig // nil if the camera has no usable talk
-	talkMu  sync.Mutex
-	talker  *talker
+	talkCfg  *TalkConfig // nil if the camera has no usable talk
+	hub      *talkHub
+	talkSent atomic.Int64 // bytes of talk blocks sent
 }
 
 // NewProducer logs in over conn, starts the stream and probes it. On error
@@ -121,8 +120,9 @@ func NewProducer(conn io.ReadWriteCloser, cfg Config, kind StreamKind, source st
 		stream:  stream,
 		talkCfg: talkCfg,
 	}
-	if nc, ok := conn.(net.Conn); ok && nc.RemoteAddr() != nil {
-		p.RemoteAddr = nc.RemoteAddr().String()
+	p.hub = &talkHub{p: p}
+	if rc, ok := conn.(interface{ RemoteAddr() net.Addr }); ok && rc.RemoteAddr() != nil {
+		p.RemoteAddr = rc.RemoteAddr().String()
 	}
 
 	if err = p.probe(); err != nil {
@@ -349,6 +349,7 @@ func (p *Producer) Start() error {
 	p.pending = nil
 	for _, m := range pending {
 		if _, err := p.handle(m); err != nil {
+			p.client.cfg.Log.Warnf("%v, reconnecting", err)
 			return err
 		}
 	}
@@ -367,6 +368,7 @@ func (p *Producer) Start() error {
 			}
 			useful, err := p.handle(m)
 			if err != nil {
+				p.client.cfg.Log.Warnf("%v, reconnecting", err)
 				return err
 			}
 			// only media that was forwarded shows the stream is alive
@@ -388,14 +390,14 @@ func (p *Producer) Start() error {
 
 // release ends talk and the camera connection after Start.
 func (p *Producer) release() {
-	p.stopTalkAsync()
+	p.stopTalk(0)
 	_ = p.client.Close()
 }
 
 // Stop cancels at once. The goodbye to the camera (stream stop, talk reset)
 // is best effort within a short budget and never delays the close.
 func (p *Producer) Stop() error {
-	p.stopTalkAsync()
+	p.stopTalk(300 * time.Millisecond)
 	_ = p.stream.Stop(0)
 	p.client.Flush(stopFlushTimeout)
 	return p.Connection.Stop()

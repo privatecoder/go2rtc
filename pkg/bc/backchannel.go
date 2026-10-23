@@ -1,6 +1,7 @@
 package bc
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -14,6 +15,22 @@ import (
 
 const talkAbilityTimeout = 3 * time.Second
 
+// These are variables only so that tests do not have to wait for them.
+var (
+	// talkIdle: an owner that gets no audio for this long ends its camera
+	// session (a muted or disconnected microphone), and another talker that
+	// does deliver audio may take over. The same track starts a new session
+	// with its next packet.
+	talkIdle = 2 * time.Second
+	// talkRetire: a talker that was silent this long and does not own the
+	// session is dropped when the next track is added. Consumers that went
+	// away only detach their track, nothing else tells us.
+	talkRetire = 30 * time.Second
+	// talkDrain: after the last block was played the camera gets this much
+	// time before the reset, which would cut off what is still playing.
+	talkDrain = 100 * time.Millisecond
+)
+
 // probeTalk asks the camera for its talk format, best effort: a camera
 // without talk (or one that does not answer) just gets no backchannel.
 func probeTalk(client *Client) *TalkConfig {
@@ -23,7 +40,7 @@ func probeTalk(client *Client) *TalkConfig {
 	}
 	cfg, err := NewTalkConfig(ability, client.cfg.Channel)
 	if err != nil {
-		client.cfg.Logf("no backchannel: %v", err)
+		client.cfg.Log.Debugf("no backchannel: %v", err)
 		return nil
 	}
 	return cfg
@@ -41,42 +58,189 @@ func talkMedia() *core.Media {
 	}
 }
 
-// talkIdle is how long a talk session may get no audio before it is reset.
-// A consumer that disconnects only detaches its track, nothing tells us, and
-// a muted browser sends nothing: the session is closed after the silence and
-// started again by the next audio packet.
-var talkIdle = 2 * time.Second
+// talkHub holds the talkers of a producer, one per track added with AddTrack,
+// and decides which of them owns the camera's single talk session.
+//
+// AddTrack only registers. The session is claimed by the first talker that
+// delivers audio; the most recent audio wins: a talker whose owner has been
+// silent for talkIdle takes the session over, the old session is ended
+// gracefully first. go2rtc replays every microphone it ever attached on a
+// reconnect, in order, and ignores errors, so a historical one must neither
+// take the session nor make the current one fail.
+type talkHub struct {
+	p *Producer
 
-// talker turns the G.711 of one consumer track into talk blocks.
+	mu      sync.Mutex
+	talkers []*talker
+	owner   *talker
+	closed  bool
+}
+
+func (h *talkHub) register(t *talker) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return false
+	}
+	h.talkers = append(h.talkers, t)
+	return true
+}
+
+// remove drops a finished talker and frees what it held.
+func (h *talkHub) remove(t *talker) {
+	h.mu.Lock()
+	for i, x := range h.talkers {
+		if x == t {
+			h.talkers = append(h.talkers[:i:i], h.talkers[i+1:]...)
+			break
+		}
+	}
+	if h.owner == t {
+		h.owner = nil
+		close(t.released)
+	}
+	h.mu.Unlock()
+}
+
+// claim makes t the owner of the camera session if nobody is, or if the owner
+// has been silent for talkIdle (then it is asked to end its session first).
+func (h *talkHub) claim(t *talker) bool {
+	for {
+		h.mu.Lock()
+		if h.closed {
+			h.mu.Unlock()
+			return false
+		}
+		owner := h.owner
+		if owner == nil || owner == t {
+			h.owner = t
+			t.released = make(chan struct{})
+			h.mu.Unlock()
+			return true
+		}
+		silent := time.Since(time.Unix(0, owner.lastAudio.Load())) >= talkIdle
+		released := owner.released
+		h.mu.Unlock()
+
+		if !silent {
+			return false // somebody is talking, this one waits for its turn
+		}
+		select {
+		case owner.yield <- struct{}{}:
+		default:
+		}
+		select {
+		case <-released:
+		case <-t.cancel:
+			return false
+		case <-time.After(5 * time.Second):
+			return false
+		}
+	}
+}
+
+// release gives up ownership.
+func (h *talkHub) release(t *talker) {
+	h.mu.Lock()
+	if h.owner == t {
+		h.owner = nil
+		close(t.released)
+	}
+	h.mu.Unlock()
+}
+
+// prune retires the talkers that were silent for talkRetire and are not the
+// owner: their tracks are long gone.
+func (h *talkHub) prune() {
+	h.mu.Lock()
+	var old []*talker
+	for _, t := range h.talkers {
+		if t != h.owner && time.Since(time.Unix(0, t.lastAudio.Load())) >= talkRetire {
+			old = append(old, t)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, t := range old {
+		t.abort()
+	}
+}
+
+// count is the number of registered talkers.
+func (h *talkHub) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.talkers)
+}
+
+// cancelAll stops everything at once and waits a moment for the workers to
+// queue their resets. Nothing registers afterwards.
+func (h *talkHub) cancelAll(wait time.Duration) {
+	h.mu.Lock()
+	h.closed = true
+	all := append([]*talker(nil), h.talkers...)
+	h.mu.Unlock()
+
+	for _, t := range all {
+		t.abort()
+	}
+	deadline := time.After(wait)
+	for _, t := range all {
+		select {
+		case <-t.done:
+		case <-deadline:
+			return
+		}
+	}
+}
+
+// talker turns the G.711 of one consumer track into talk blocks. One worker
+// goroutine owns all of its conversion state; other goroutines only signal it
+// through channels.
 type talker struct {
+	h       *talkHub
 	p       *Producer
 	cfg     TalkConfig
 	decode  func(byte) int16
 	srcRate uint32
-	idle    time.Duration
+	sender  *core.Sender
 
-	closing atomic.Bool // set by Producer.Stop, checked without the mutex
+	in       chan []byte   // G.711 payloads from the sender
+	closeReq chan struct{} // the sender was closed: end gracefully
+	cancel   chan struct{} // forced stop: abort at once
+	yield    chan struct{} // another talker wants the session
+	done     chan struct{} // the worker exited
+	released chan struct{} // closed when this talker gives up the session (guarded by hub.mu)
 
-	mu       sync.Mutex
-	closed   bool
-	talk     *Talk // nil while idle
-	enc      ADPCMEncoder
-	resample func([]int16) []int16
-	samples  []int16
-	next     time.Time // when the previous block has finished playing
-	last     time.Time // last audio packet
-	warned   bool
+	cancelOnce, closeOnce sync.Once
+	lastAudio             atomic.Int64 // unix nanoseconds
+
+	// worker only
+	session *Talk
+	enc     ADPCMEncoder
+	rs      *resampler
+	samples []int16
+	next    time.Time // when the last block has played
+	warned  bool
 }
 
-// AddTrack starts two-way audio: G.711 from the consumer is converted to PCM
-// at the camera's rate, cut into ADPCM blocks of the size the camera asked
-// for and sent paced to real time. Closing the sender ends the session.
+func (t *talker) abort() { t.cancelOnce.Do(func() { close(t.cancel) }) }
+
+func (t *talker) requestClose() { t.closeOnce.Do(func() { close(t.closeReq) }) }
+
+// AddTrack registers a microphone track for two-way audio. The camera's talk
+// session starts with the first audio that arrives, see talkHub.
 func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiver) error {
 	if p.talkCfg == nil {
 		return errors.New("bc: camera does not support talk")
 	}
 
-	t := &talker{p: p, cfg: *p.talkCfg, srcRate: track.Codec.ClockRate, idle: talkIdle}
+	t := &talker{
+		h: p.hub, p: p, cfg: *p.talkCfg, srcRate: track.Codec.ClockRate,
+		in: make(chan []byte, 64), closeReq: make(chan struct{}), cancel: make(chan struct{}),
+		yield: make(chan struct{}, 1), done: make(chan struct{}),
+	}
+	t.lastAudio.Store(time.Now().UnixNano())
 	if t.srcRate == 0 {
 		t.srcRate = 8000
 	}
@@ -89,170 +253,262 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 		return fmt.Errorf("bc: talk does not support codec %s", track.Codec.Name)
 	}
 
-	p.talkMu.Lock()
-	defer p.talkMu.Unlock()
-
-	// one session at a time, a talker that went quiet gives way
-	if old := p.talker; old != nil {
-		if old.active() {
-			return ErrTalkBusy
-		}
-		old.shutdown()
+	if !p.hub.register(t) {
+		return errors.New("bc: producer stopped")
 	}
+	p.hub.prune()
 
-	t.mu.Lock()
-	err := t.startLocked()
-	t.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	p.talker = t
+	t.sender = core.NewSender(media, track.Codec)
+	t.sender.Handler = t.push
+	t.sender.HandleRTP(track)
 
-	sender := core.NewSender(media, track.Codec)
-	sender.Handler = t.handle
-	sender.HandleRTP(track)
-	p.Senders = append(p.Senders, sender)
-
+	go t.run()
 	go func() {
-		sender.Wait() // returns when the sender is closed
-		t.shutdown()
+		t.sender.Wait() // returns when the sender is closed
+		t.requestClose()
 	}()
-	go t.watchIdle()
 	return nil
 }
 
-func (t *talker) active() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return !t.closed && t.talk != nil
-}
-
-// startLocked opens a talk session with fresh conversion state.
-func (t *talker) startLocked() error {
-	talk, err := t.p.client.StartTalk(t.cfg)
-	if err != nil {
-		return err
+// push is the sender's handler. It never blocks; a worker that cannot keep
+// up loses audio.
+func (t *talker) push(packet *rtp.Packet) {
+	if len(packet.Payload) == 0 {
+		return
 	}
-	t.talk = talk
-	t.enc = ADPCMEncoder{}
-	t.samples = t.samples[:0]
-	t.next = time.Time{}
-	t.last = time.Now()
-
-	t.resample = nil
-	switch {
-	case talk.SampleRate > t.srcRate:
-		t.resample = pcm.Upsample(float32(talk.SampleRate) / float32(t.srcRate))
-	case talk.SampleRate < t.srcRate:
-		t.resample = pcm.Downsample(float32(t.srcRate) / float32(talk.SampleRate))
-	}
-	return nil
-}
-
-func (t *talker) stopLocked() {
-	if t.talk != nil {
-		_ = t.talk.Stop()
-		t.talk = nil
+	t.lastAudio.Store(time.Now().UnixNano())
+	b := append([]byte(nil), packet.Payload...)
+	select {
+	case t.in <- b:
+	default:
 	}
 }
 
-func (t *talker) shutdown() {
-	t.mu.Lock()
-	t.closed = true
-	t.stopLocked()
-	t.mu.Unlock()
-}
+func (t *talker) run() {
+	defer close(t.done)
+	defer func() {
+		t.h.remove(t)
+		t.sender.Close() // frees the sender, its queue and its wait goroutine
+	}()
 
-func (t *talker) watchIdle() {
-	tick := time.NewTicker(t.idle / 4)
-	defer tick.Stop()
-	for range tick.C {
-		t.mu.Lock()
-		if t.closed {
-			t.mu.Unlock()
+	idle := time.NewTimer(time.Hour)
+	defer idle.Stop()
+	clientDone := t.p.client.Done()
+
+	for {
+		var idleC <-chan time.Time
+		var rejected <-chan struct{}
+		if t.session != nil {
+			idleC, rejected = idle.C, t.session.Rejected()
+		}
+
+		select {
+		case <-t.cancel:
+			t.abortSession()
 			return
-		}
-		if t.talk != nil && time.Since(t.last) > t.idle {
-			t.stopLocked()
-		}
-		t.mu.Unlock()
-	}
-}
+		case <-clientDone:
+			t.session = nil
+			return
 
-// handle is the sender's handler, one packet at a time.
-func (t *talker) handle(packet *rtp.Packet) {
-	if t.closing.Load() {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.closed {
-		return
-	}
-	if t.talk == nil {
-		if err := t.startLocked(); err != nil {
-			if !t.warned {
-				t.warned = true
-				t.p.client.cfg.Logf("talk: %v", err)
+		case <-t.closeReq:
+			// drain what the sender queued before it was closed, then end
+			for more := true; more; {
+				select {
+				case g := <-t.in:
+					if !t.handleAudio(g, idle) {
+						t.abortSession()
+						return
+					}
+				default:
+					more = false
+				}
 			}
+			t.endSession(true)
 			return
-		}
-		t.warned = false
-	}
-	t.last = time.Now()
 
-	pcm16 := make([]int16, len(packet.Payload))
-	for i, b := range packet.Payload {
+		case <-t.yield:
+			t.endSession(true)
+		case <-idleC:
+			t.endSession(true)
+		case <-rejected:
+			t.p.client.cfg.Log.Warnf("talk: %v, ending the session", t.session.Err())
+			t.endSession(true)
+
+		case g := <-t.in:
+			if !t.handleAudio(g, idle) {
+				t.abortSession()
+				return
+			}
+		}
+	}
+}
+
+// handleAudio converts and sends one packet. It returns false when canceled.
+func (t *talker) handleAudio(g []byte, idle *time.Timer) bool {
+	if t.session == nil && !t.startSession() {
+		return !t.canceled()
+	}
+	if !idle.Stop() {
+		select {
+		case <-idle.C:
+		default:
+		}
+	}
+	idle.Reset(talkIdle)
+
+	pcm16 := make([]int16, len(g))
+	for i, b := range g {
 		pcm16[i] = t.decode(b)
 	}
-	if t.resample != nil {
-		pcm16 = t.resample(pcm16)
+	if t.rs != nil {
+		pcm16 = t.rs.process(pcm16)
 	}
 	t.samples = append(t.samples, pcm16...)
 
-	dataBytes := t.talk.DataBytes
-	perBlock := ADPCMSamples(dataBytes)
-	blockTime := time.Duration(perBlock) * time.Second / time.Duration(t.talk.SampleRate)
-
-	for len(t.samples) >= perBlock {
-		block, err := t.enc.EncodeBlock(t.samples[:perBlock], dataBytes)
-		if err != nil {
-			return
+	perBlock := ADPCMSamples(t.session.DataBytes)
+	for t.session != nil && len(t.samples) >= perBlock {
+		if !t.sendBlock(t.samples[:perBlock]) {
+			return !t.canceled()
 		}
 		t.samples = t.samples[perBlock:]
+	}
+	return true
+}
 
-		// the camera buffers little: a block goes out when the previous one
-		// has played, never in a burst
-		if wait := time.Until(t.next); wait > 0 {
-			time.Sleep(wait)
-		}
-		now := time.Now()
-		if err = t.talk.Send(block); err != nil {
-			t.p.client.cfg.Logf("talk: %v", err)
-			t.stopLocked()
-			return
-		}
-		t.next = now.Add(blockTime)
-		t.p.Send += len(block)
+// canceled reports a forced stop or a transport that is gone.
+func (t *talker) canceled() bool {
+	select {
+	case <-t.cancel:
+		return true
+	case <-t.p.client.Done():
+		return true
+	default:
+		return false
 	}
 }
 
-// stopTalkAsync ends the talk session without waiting for anything: the
-// talker is marked closed (atomically, its mutex may be held by a handler
-// sleeping or talking to the camera) and the reset is only queued.
-func (p *Producer) stopTalkAsync() {
-	p.talkMu.Lock()
-	t := p.talker
-	p.talkMu.Unlock()
-	if t != nil {
-		t.closing.Store(true)
+// startSession claims the camera session for this talker and opens it.
+func (t *talker) startSession() bool {
+	if !t.h.claim(t) {
+		return false // an active talker owns it, or we are stopping
+	}
+	session, err := t.p.client.StartTalkCancel(t.cfg, t.cancel)
+	if err != nil {
+		t.h.release(t)
+		if !t.warned && !t.canceled() {
+			t.warned = true
+			t.p.client.cfg.Log.Warnf("talk: %v", err)
+		}
+		return false
+	}
+	t.warned = false
+
+	t.session = session
+	t.enc = ADPCMEncoder{}
+	t.samples = t.samples[:0]
+	t.next = time.Time{}
+	t.rs = nil
+	if session.SampleRate != t.srcRate {
+		t.rs = newResampler(t.srcRate, session.SampleRate)
+	}
+	return true
+}
+
+func (t *talker) blockDuration() time.Duration {
+	return time.Duration(ADPCMSamples(t.session.DataBytes)) * time.Second / time.Duration(t.session.SampleRate)
+}
+
+// sleepUntil waits for the time, the forced stop or the transport. It
+// reports false when it was cut short.
+func (t *talker) sleepUntil(at time.Time) bool {
+	d := time.Until(at)
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-t.cancel:
+		return false
+	case <-t.p.client.Done():
+		return false
+	}
+}
+
+// sendBlock encodes one block of samples (padded if short) and sends it when
+// the previous block has played: the camera buffers little, so never a burst.
+func (t *talker) sendBlock(samples []int16) bool {
+	block, err := t.enc.EncodeBlock(samples, t.session.DataBytes)
+	if err != nil {
+		return true
+	}
+	if !t.sleepUntil(t.next) {
+		return false
+	}
+	now := time.Now()
+	if err = t.session.Send(block); err != nil {
+		if !errors.Is(err, ErrTalkStopped) {
+			t.p.client.cfg.Log.Warnf("talk: %v", err)
+		}
+		t.dropSession()
+		return false
+	}
+	t.next = now.Add(t.blockDuration())
+	t.p.talkSent.Add(int64(len(block)))
+	return true
+}
+
+// endSession ends the camera session. Gracefully the rest of the audio goes
+// out as a final padded block and the reset waits until it has played (plus a
+// margin), like neolink's talk_stream; a reset would cut it off.
+func (t *talker) endSession(graceful bool) {
+	s := t.session
+	if s == nil {
+		return
 	}
 
-	p.client.mu.Lock()
-	talk := p.client.talk
-	p.client.mu.Unlock()
-	if talk != nil {
-		talk.StopAsync()
+	if graceful {
+		if len(t.samples) > 0 && !s.Stopped() {
+			if !t.sendBlock(t.samples) {
+				t.abortSession()
+				return
+			}
+		}
+		if !t.sleepUntil(t.next.Add(talkDrain)) {
+			t.abortSession()
+			return
+		}
 	}
+
+	t.session = nil
+	t.samples = t.samples[:0]
+	_ = s.StopCancel(2*time.Second, t.cancel)
+	t.h.release(t)
+}
+
+// dropSession ends a session that failed.
+func (t *talker) dropSession() {
+	if s := t.session; s != nil {
+		t.session = nil
+		t.samples = t.samples[:0]
+		s.StopAsync()
+		t.h.release(t)
+	}
+}
+
+// abortSession is the forced end: the reset is only queued.
+func (t *talker) abortSession() { t.dropSession() }
+
+// stopTalk cancels every talker and waits briefly for their resets to be
+// queued. It never waits for the camera.
+func (p *Producer) stopTalk(wait time.Duration) { p.hub.cancelAll(wait) }
+
+// MarshalJSON adds the bytes sent for talk, which are counted atomically, to
+// the connection info (core.Connection.Send is a plain int).
+func (p *Producer) MarshalJSON() ([]byte, error) {
+	c := p.Connection
+	c.Send = int(p.talkSent.Load())
+	return json.Marshal(&c)
 }

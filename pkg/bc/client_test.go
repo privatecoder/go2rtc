@@ -219,7 +219,7 @@ func TestPingRejectedStopsPinging(t *testing.T) {
 
 	var logs atomic.Int32
 	cfg := fastConfig()
-	cfg.Logf = func(string, ...any) { logs.Add(1) }
+	cfg.Log = Logger{Warnf: func(string, ...any) { logs.Add(1) }}
 	cfg.PingInterval = 10 * time.Millisecond
 	cfg.PingTimeout = 50 * time.Millisecond
 	c := dialFake(t, f, cfg)

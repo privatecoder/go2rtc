@@ -204,13 +204,15 @@ func TestSplitAVCC(t *testing.T) {
 }
 
 func TestDialErrors(t *testing.T) {
-	_, err := Dial("bc://u:p@95270000ABCDEFGH?stream=sub")
-	require.ErrorContains(t, err, "P2P/UID not implemented")
+	_, err := Dial("bc://u:p@95270000ABCDEFGH?discovery=telepathy")
+	require.ErrorContains(t, err, "unknown discovery")
 
 	_, err = Dial("bc://u:p@127.0.0.1?stream=huge")
 	require.ErrorContains(t, err, "unknown stream")
 
-	// a UID-looking name with a port is a host
+	// a UID-looking name with a port is a host, not a UID
 	_, err = Dial("bc://u:p@ABCDEFGHIJ0:1")
-	require.NotContains(t, err.Error(), "P2P")
+	require.NotContains(t, err.Error(), "discovery")
+	_, err = Dial("bc://u:p@ABCDEFGHIJ0:1?discovery=telepathy")
+	require.NotContains(t, err.Error(), "unknown discovery")
 }

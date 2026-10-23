@@ -371,7 +371,7 @@ func TestStartClosesClientOnIdle(t *testing.T) {
 
 	// the camera side sees the connection go
 	f.mu.Lock()
-	conn := f.conn
+	conn := f.conn.(net.Conn)
 	f.mu.Unlock()
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	_, err = conn.Read(make([]byte, 1))
@@ -888,7 +888,7 @@ func TestLogfNotCalledUnderStreamLock(t *testing.T) {
 	logged := make(chan struct{}, 8)
 	cfg := fastConfig()
 	cfg.StreamBuffer = 2
-	cfg.Logf = func(string, ...any) {
+	cfg.Log.Warnf = func(string, ...any) {
 		// a logger that uses the stream (stats, say) must not deadlock
 		if s := st.Load(); s != nil {
 			s.mu.Lock()

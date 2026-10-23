@@ -97,6 +97,7 @@ func TestStartTalkSendStop(t *testing.T) {
 	// one session at a time
 	_, err = c.StartTalk(cfg)
 	require.ErrorIs(t, err, ErrTalkBusy)
+	require.Equal(t, []string{"config:200"}, f.events(), "the refused one sent nothing")
 
 	var enc ADPCMEncoder
 	for i := 0; i < 3; i++ {
@@ -118,8 +119,8 @@ func TestStartTalkSendStop(t *testing.T) {
 
 	require.NoError(t, talk.Stop())
 	require.NoError(t, talk.Stop()) // idempotent
-	require.Equal(t, []string{"config:200", "reset"}, f.events())
-	require.ErrorIs(t, talk.Send(make([]byte, 8)), ErrTalkStopped)
+	require.Equal(t, []string{"config:200", "reset"}, f.sessionEvents())
+	require.ErrorIs(t, talk.Send(make([]byte, 204)), ErrTalkStopped)
 
 	// the slot is free again
 	talk2, err := c.StartTalk(cfg)
@@ -140,7 +141,7 @@ func TestStartTalk422ResetsAndRetries(t *testing.T) {
 
 	// a second 422 is final and releases the session slot
 	f.mu.Lock()
-	f.talkFail, f.talkEvents = 2, nil
+	f.talkFail, f.talkEvents, f.eventAt = 2, nil, nil
 	f.mu.Unlock()
 	_, err = c.StartTalk(cfg)
 	require.ErrorContains(t, err, "422")
@@ -230,6 +231,26 @@ func newTalkProducer(t *testing.T, f *fakeCamera) *Producer {
 	return p
 }
 
+func fastIdle(t *testing.T) {
+	setVar(t, &talkIdle, 200*time.Millisecond)
+}
+
+// lerp2 is the 8 kHz tone at 16 kHz with linear interpolation: every source
+// sample, and the mean of it and the next in between.
+func lerp2(src []byte, decode func(byte) int16, n int) []int16 {
+	out := make([]int16, n)
+	for i := range out {
+		a := int64(decode(src[i/2]))
+		if i%2 == 0 {
+			out[i] = int16(a)
+		} else {
+			b := int64(decode(src[i/2+1]))
+			out[i] = int16(a + (b-a)/2)
+		}
+	}
+	return out
+}
+
 func TestProducerTalk(t *testing.T) {
 	fastIdle(t)
 	f := newFakeCamera(t)
@@ -251,19 +272,20 @@ func TestProducerTalk(t *testing.T) {
 	track := core.NewReceiver(&core.Media{Kind: core.KindAudio, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{codec}}, codec)
 	require.NoError(t, p.AddTrack(back, back.Codecs[0], track))
 
-	// only one talk session at a time
+	// registering opens nothing at the camera, and a second track is no error
 	other := core.NewReceiver(nil, codec)
-	require.ErrorIs(t, p.AddTrack(back, back.Codecs[0], other), ErrTalkBusy)
+	require.NoError(t, p.AddTrack(back, back.Codecs[0], other))
+	time.Sleep(50 * time.Millisecond)
+	require.Empty(t, f.sessionEvents())
 
 	src := tone(4000, true)
 	feed(track, src)
 
-	// 4000 samples at 8 kHz -> 8000 at 16 kHz -> 15 whole blocks of 513
-	const want = 15
-	require.Eventually(t, func() bool { return len(f.blocks()) >= want }, 3*time.Second, 5*time.Millisecond)
-	time.Sleep(100 * time.Millisecond)
-	blocks := f.blocks()
-	require.Len(t, blocks, want)
+	// 4000 samples at 8 kHz -> 7998 at 16 kHz (linear interpolation needs the
+	// next sample) -> 15 whole blocks of 513 and a tail of 303 for the final block
+	const whole = 15
+	require.Eventually(t, func() bool { return len(f.blocks()) >= whole }, 3*time.Second, 5*time.Millisecond)
+	blocks := f.blocks()[:whole]
 
 	var out []int16
 	var lastIndex byte
@@ -289,14 +311,14 @@ func TestProducerTalk(t *testing.T) {
 		lastIndex = byte(s.index)
 	}
 
-	// samples: the tone at 16 kHz (each 8 kHz sample twice, pkg/pcm's upsampling)
+	ref := lerp2(src, pcm.PCMAtoPCM, len(out))
 	var sig, noise float64
 	for i, got := range out {
-		ref := float64(pcm.PCMAtoPCM(src[i/2]))
-		sig += ref * ref
-		noise += (ref - float64(got)) * (ref - float64(got))
+		r := float64(ref[i])
+		sig += r * r
+		noise += (r - float64(got)) * (r - float64(got))
 	}
-	require.Len(t, out, want*513)
+	require.Len(t, out, whole*513)
 	snr := 10 * math.Log10(sig/noise)
 	require.Greater(t, snr, 20.0, "SNR %.1f dB", snr)
 
@@ -305,27 +327,27 @@ func TestProducerTalk(t *testing.T) {
 	require.GreaterOrEqual(t, span, 14*32*time.Millisecond*8/10, "sent in a burst")
 	require.Less(t, span, 14*32*time.Millisecond*2)
 
-	// the consumer goes away: it only detaches its track, the silence ends the session
+	// the track is detached, nothing more comes: the tail leaves as one more
+	// block, padded, and the reset waits until it has played
 	track.Close()
-	require.Eventually(t, func() bool {
-		ev := f.sessionEvents()
-		return ev[len(ev)-1] == "reset"
-	}, 3*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return len(f.blocks()) == whole+1 }, 3*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return len(f.sessionEvents()) == 2 }, 3*time.Second, 5*time.Millisecond)
+	require.Equal(t, []string{"config:200", "reset"}, f.sessionEvents())
+	tail := f.blocks()[whole]
+	reset := f.eventTime("reset", 0)
+	blockTime := 513 * time.Second / 16000
+	require.GreaterOrEqual(t, reset.Sub(tail.at), blockTime+talkDrain-10*time.Millisecond, "reset after the last block has played")
 
-	// a new consumer can talk again, the quiet talker gave way
+	// a new microphone can talk again
 	track2 := core.NewReceiver(nil, codec)
 	require.NoError(t, p.AddTrack(back, back.Codecs[0], track2))
+	feed(track2, tone(1200, true))
+	require.Eventually(t, func() bool { return len(f.sessionEvents()) == 3 }, 3*time.Second, 5*time.Millisecond)
 	require.NoError(t, p.Stop())
 	require.Eventually(t, func() bool {
 		ev := f.sessionEvents()
 		return ev[len(ev)-1] == "reset"
 	}, time.Second, 5*time.Millisecond, "Stop ends the session")
-}
-
-func fastIdle(t *testing.T) {
-	old := talkIdle
-	talkIdle = 200 * time.Millisecond
-	t.Cleanup(func() { talkIdle = old })
 }
 
 func TestProducerTalkIdleRestarts(t *testing.T) {
@@ -360,13 +382,22 @@ func TestProducerTalkSenderClose(t *testing.T) {
 	codec := &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
 	track := core.NewReceiver(nil, codec)
 	require.NoError(t, p.AddTrack(back, codec, track))
-	require.Equal(t, []string{"config:200"}, f.sessionEvents())
+	feed(track, tone(401, true))
+	require.Eventually(t, func() bool { return len(f.blocks()) == 1 }, time.Second, time.Millisecond)
 
-	p.Senders[0].Close()
-	require.Eventually(t, func() bool {
-		ev := f.sessionEvents()
-		return len(ev) == 2 && ev[1] == "reset"
-	}, time.Second, 5*time.Millisecond, "StopTalk when the sender is closed")
+	p.hub.mu.Lock()
+	sender := p.hub.talkers[0].sender
+	p.hub.mu.Unlock()
+	sender.Close()
+
+	// graceful: the block (50 ms) plays out and gets its margin before the reset
+	require.Eventually(t, func() bool { return len(f.sessionEvents()) == 2 }, time.Second, 5*time.Millisecond)
+	gap := f.eventTime("reset", 0).Sub(f.blocks()[0].at)
+	require.GreaterOrEqual(t, gap, 401*time.Second/8000+talkDrain-10*time.Millisecond)
+	require.Less(t, gap, time.Second)
+
+	// and the talker is gone with its sender
+	require.Eventually(t, func() bool { return p.hub.count() == 0 }, time.Second, 5*time.Millisecond)
 }
 
 func TestProducerTalkPCMUAtCameraRate(t *testing.T) {

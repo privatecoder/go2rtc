@@ -2,21 +2,34 @@
 package bc
 
 import (
+	"context"
 	"errors"
 	"net/url"
 	"regexp"
+	"time"
 
+	"github.com/AlexxIT/go2rtc/pkg/bc/udp"
 	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
 var reUID = regexp.MustCompile(`^[0-9A-Z]{10,}$`)
 
+// discoveryTimeout bounds finding a camera by UID.
+const discoveryTimeout = 30 * time.Second
+
 // Dial opens a bc:// source:
 //
 //	bc://user:pass@192.168.1.20[:9000]?channel=0&stream=main|sub|extern&encryption=aes|bc|none
+//	bc://user:pass@95270000ABCDEFGH?stream=sub&discovery=local|remote|map|relay&addr=192.168.1.20
 //
-// A bare UID as host means Reolink P2P, which is not implemented yet.
+// A host that is a bare UID (10 or more capital letters and digits, no port)
+// is a camera reached over Reolink's P2P service instead of a TCP address.
 func Dial(rawURL string) (core.Producer, error) {
+	return dial(rawURL, nil)
+}
+
+// dial is Dial with a hook to change the discovery options, for tests.
+func dial(rawURL string, tune func(*udp.Options)) (core.Producer, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
@@ -39,12 +52,40 @@ func Dial(rawURL string) (core.Producer, error) {
 		channel = core.ParseByte(s)
 	}
 
-	if u.Port() == "" && reUID.MatchString(u.Hostname()) {
-		return nil, errors.New("bc: P2P/UID not implemented yet")
-	}
-
 	password, _ := u.User.Password()
-	cfg := Config{Username: u.User.Username(), Password: password, Channel: channel, Encryption: enc}
+	cfg := Config{Username: u.User.Username(), Password: password, Channel: channel, Encryption: enc, Name: u.Hostname()}
+
+	if u.Port() == "" && reUID.MatchString(u.Hostname()) {
+		method, ok := udp.ParseMethod(query.Get("discovery"))
+		if !ok {
+			return nil, errors.New("bc: unknown discovery " + query.Get("discovery") + ", use local, remote, map or relay")
+		}
+
+		opts := udp.Options{
+			Method: method,
+			Addr:   query.Get("addr"),
+			Region: query.Get("region"),
+			Log:    Log.Prefix(u.Hostname()),
+		}
+		if tune != nil {
+			tune(&opts)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), discoveryTimeout)
+		defer cancel()
+
+		conn, err := udp.Discover(ctx, u.Hostname(), opts)
+		if err != nil {
+			return nil, err
+		}
+
+		prod, err := NewProducer(conn, cfg, kind, rawURL)
+		if err != nil {
+			return nil, err
+		}
+		prod.Protocol = "udp"
+		return prod, nil
+	}
 
 	conn, err := DialTCP(u.Host)
 	if err != nil {

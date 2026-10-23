@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/bc/udp"
 )
 
 const DefaultPort = "9000"
@@ -109,13 +111,23 @@ type Config struct {
 	StreamBuffer   int           // frames buffered per stream, default 128
 	WriteQueue     int           // outbound messages queued for the writer, default 128
 
-	// Logf receives rare diagnostics, default is the package level Logf.
-	Logf func(format string, args ...any)
+	// Name prefixes every log message (the UID or host of the camera).
+	Name string
+	// Log receives the diagnostics, default is the package level Log.
+	Log Logger
 }
 
-// Logf is the default sink for diagnostics (slow consumer, ping trouble), the
-// application replaces it to use its own logger.
-var Logf = func(format string, args ...any) { log.Printf("[bc] "+format, args...) }
+// Logger has a function per level: Debugf for routine steps, Infof for
+// outcomes (logged in, the chosen path), Warnf for trouble (drops, retries,
+// format changes). Nil functions discard.
+type Logger = udp.Logger
+
+// Log is the default logger, the application replaces it to use its own.
+var Log = Logger{
+	Debugf: func(format string, args ...any) {},
+	Infof:  func(format string, args ...any) { log.Printf("[bc] "+format, args...) },
+	Warnf:  func(format string, args ...any) { log.Printf("[bc] warning: "+format, args...) },
+}
 
 func (c *Config) setDefaults() {
 	if c.WriteTimeout == 0 {
@@ -139,8 +151,12 @@ func (c *Config) setDefaults() {
 	if c.StreamBuffer == 0 {
 		c.StreamBuffer = 128
 	}
-	if c.Logf == nil {
-		c.Logf = Logf
+	if c.Log.Debugf == nil && c.Log.Infof == nil && c.Log.Warnf == nil {
+		c.Log = Log
+	}
+	c.Log = c.Log.Filled()
+	if c.Name != "" {
+		c.Log = c.Log.Prefix(c.Name)
 	}
 }
 
@@ -393,6 +409,14 @@ func (s *sub) close() {
 }
 
 func (s *sub) recv(timeout time.Duration) (*Message, error) {
+	return s.recvCancel(timeout, nil)
+}
+
+// ErrCanceled is returned when a wait is cut short by its cancel channel.
+var ErrCanceled = errors.New("bc: canceled")
+
+// recvCancel waits for a reply, the timeout, the client closing or cancel.
+func (s *sub) recvCancel(timeout time.Duration, cancel <-chan struct{}) (*Message, error) {
 	t := time.NewTimer(timeout)
 	defer t.Stop()
 	select {
@@ -402,6 +426,8 @@ func (s *sub) recv(timeout time.Duration) (*Message, error) {
 		return nil, ErrTimeout
 	case <-s.c.done:
 		return nil, s.c.Err()
+	case <-cancel:
+		return nil, ErrCanceled
 	}
 }
 
@@ -515,6 +541,7 @@ func (c *Client) Login() (*DeviceInfo, error) {
 	}
 
 	c.Info = r.Body.DeviceInfo
+	c.cfg.Log.Infof("logged in: %s", c.Info.describe())
 	c.wg.Add(1)
 	go c.pingLoop()
 	return c.Info, nil
@@ -542,7 +569,7 @@ func (c *Client) pingLoop() {
 		case err == nil:
 			missed = 0
 		case errors.Is(err, errPingUnsupp):
-			c.cfg.Logf("pings not supported by the camera (%v), keeping the connection without them", err)
+			c.cfg.Log.Warnf("pings not supported by the camera (%v), keeping the connection without them", err)
 			return
 		case errors.Is(err, ErrTimeout):
 			if missed++; missed >= c.cfg.MaxMissedPings {
@@ -764,7 +791,7 @@ func (s *Stream) noteDrop() {
 	if now := time.Now(); now.Sub(s.lastWarn) >= 5*time.Second {
 		n := s.warnDrop
 		s.lastWarn, s.warnDrop = now, 0
-		s.c.cfg.Logf("slow consumer, dropped %d frame(s) to keep the connection alive", n)
+		s.c.cfg.Log.Warnf("slow consumer, dropped %d frame(s) to keep the connection alive", n)
 	}
 }
 
