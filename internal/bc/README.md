@@ -85,8 +85,9 @@ Needs outgoing UDP to `p2p*.reolink.com` (port 9999) and the addresses they retu
 (`media path: ...`): direct on the LAN, direct to the public address, or through the relay. The transport reports its real receive rate to
 the camera in every acknowledgement, which is what lets the camera send its full bitrate.
 
-Failed registrations are retried after 1, 2, 4 ... 60 seconds, and that delay carries over to the next connection attempt for the same
-UID: Reolink limits rapid reconnects per camera, so the source does not retry faster than that.
+Failed registrations are retried after 1, 2, 4 ... 30 seconds, and that delay carries over to the next connection attempt for the same
+UID: Reolink limits rapid reconnects per camera, so the source does not retry faster than that. A call that would only wait out the
+delay returns at once with `waiting for P2P cooldown, retry in Ns` and does not extend it.
 
 ## Notes and known limitations
 

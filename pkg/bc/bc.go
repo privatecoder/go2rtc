@@ -4,6 +4,7 @@ package bc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"regexp"
 	"time"
@@ -76,6 +77,10 @@ func dial(rawURL string, tune func(*udp.Options)) (core.Producer, error) {
 
 		conn, err := udp.Discover(ctx, u.Hostname(), opts)
 		if err != nil {
+			var cd *udp.CooldownError
+			if errors.As(err, &cd) {
+				return nil, fmt.Errorf("bc: waiting for P2P cooldown, retry in %ds", int(cd.Wait.Round(time.Second)/time.Second))
+			}
 			return nil, err
 		}
 

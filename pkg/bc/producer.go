@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,13 +48,34 @@ var (
 // the old format, go2rtc reconnects and probes again.
 var ErrFormatChanged = errors.New("bc: video format changed")
 
-// The RTP timeline of every producer in the process comes from one clock so
-// that a replacement producer (go2rtc reconnects and moves the consumers
-// over) continues after the one it replaces instead of starting at 0.
+// The RTP timeline of a source comes from the process clock, and what a
+// producer hands out is remembered per source (the URL), so that a replacement
+// producer (go2rtc reconnects and moves the consumers over) continues after the
+// one it replaces instead of starting at 0 again: timestamps and, because the
+// consumers keep one RTP session, the AAC sequence numbers too. One camera's
+// clock never moves another camera's timeline.
 var (
 	processStart = time.Now()
-	timelineEnd  atomic.Uint64 // µs, the furthest video timestamp handed out
+
+	sourcesMu sync.Mutex
+	sources   = map[string]*sourceState{}
 )
+
+type sourceState struct {
+	endUS atomic.Uint64 // µs, the furthest timestamp handed out
+	seq   atomic.Uint32 // last RTP sequence number of the audio packets
+}
+
+func sourceOf(key string) *sourceState {
+	sourcesMu.Lock()
+	defer sourcesMu.Unlock()
+	s := sources[key]
+	if s == nil {
+		s = new(sourceState)
+		sources[key] = s
+	}
+	return s
+}
 
 type audioKind uint8
 
@@ -80,7 +102,8 @@ type Producer struct {
 
 	audioKind   audioKind
 	audioFormat uint32 // AAC: profile, rate and channels of the probed stream
-	audioSeq    uint16
+
+	src *sourceState
 
 	based  bool
 	baseUS uint64 // where this producer's camera clock starts on the process timeline
@@ -121,6 +144,7 @@ func NewProducer(conn io.ReadWriteCloser, cfg Config, kind StreamKind, source st
 		talkCfg: talkCfg,
 	}
 	p.hub = &talkHub{p: p}
+	p.src = sourceOf(source)
 	if rc, ok := conn.(interface{ RemoteAddr() net.Addr }); ok && rc.RemoteAddr() != nil {
 		p.RemoteAddr = rc.RemoteAddr().String()
 	}
@@ -242,6 +266,25 @@ func paramTypes(hevc bool) []byte {
 	return []byte{h264.NALUTypeSPS, h264.NALUTypePPS}
 }
 
+func isParam(typ byte, hevc bool) bool {
+	for _, t := range paramTypes(hevc) {
+		if t == typ {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalSets is the current parameter sets as AVCC, in the order a
+// decoder wants them (VPS, SPS, PPS).
+func canonicalSets(params map[byte][]byte, hevc bool) []byte {
+	var sets [][]byte
+	for _, typ := range paramTypes(hevc) {
+		sets = append(sets, params[typ])
+	}
+	return h264.JoinNALU(sets...)
+}
+
 func paramOK(typ byte, n int, hevc bool) bool {
 	switch {
 	case hevc:
@@ -266,26 +309,30 @@ func (p *Producer) probeVideo(m *Media) bool {
 		return false
 	}
 
+	// every occurrence is checked, the helpers read all of them
 	params := map[byte][]byte{}
 	for _, n := range nals {
-		for _, typ := range paramTypes(hevc) {
-			if n.typ == typ && params[typ] == nil {
-				if !paramOK(typ, len(n.data), hevc) {
-					return false
-				}
-				params[typ] = n.data
-			}
+		if !isParam(n.typ, hevc) {
+			continue
+		}
+		if !paramOK(n.typ, len(n.data), hevc) {
+			return false
+		}
+		if params[n.typ] == nil {
+			params[n.typ] = n.data
 		}
 	}
 	if len(params) != len(paramTypes(hevc)) {
 		return false
 	}
 
+	// the codec is made from the validated sets, not from the untrusted unit
+	canon := canonicalSets(params, hevc)
 	var codec *core.Codec
 	if hevc {
-		codec = h265.AVCCToCodec(avcc)
+		codec = h265.AVCCToCodec(canon)
 	} else {
-		codec = h264.AVCCToCodec(avcc)
+		codec = h264.AVCCToCodec(canon)
 	}
 
 	p.videoCodec, p.hevc, p.params = m.Codec, hevc, params
@@ -371,8 +418,10 @@ func (p *Producer) Start() error {
 				p.client.cfg.Log.Warnf("%v, reconnecting", err)
 				return err
 			}
-			// only media that was forwarded shows the stream is alive
-			if useful {
+			// only media that was forwarded shows the stream is alive; with video
+			// in the stream that is video, audio alone must not hide a video that
+			// stalled or whose keyframes are all damaged
+			if useful && (p.video == nil || m.Kind == KindIframe || m.Kind == KindPframe) {
 				if !idle.Stop() {
 					select {
 					case <-idle.C:
@@ -448,11 +497,24 @@ func (p *Producer) handleVideo(m *Media) (bool, error) {
 	}
 
 	if m.Kind == KindIframe {
-		// parameter sets must stay what the consumers were set up with
+		// every parameter set in it must be sane, and must stay what the
+		// consumers were set up with
+		var have int
 		for _, n := range nals {
-			if cur, ok := p.params[n.typ]; ok && !bytes.Equal(cur, n.data) {
+			if !isParam(n.typ, p.hevc) {
+				continue
+			}
+			if !paramOK(n.typ, len(n.data), p.hevc) {
+				p.needKey = true
+				return false, nil
+			}
+			if !bytes.Equal(p.params[n.typ], n.data) {
 				return false, fmt.Errorf("%w: parameter set %d changed", ErrFormatChanged, n.typ)
 			}
+			have++
+		}
+		if have < len(paramTypes(p.hevc)) {
+			avcc = p.selfContained(nals)
 		}
 		p.needKey = false
 	} else if p.needKey {
@@ -461,7 +523,7 @@ func (p *Producer) handleVideo(m *Media) (bool, error) {
 
 	p.setBase()
 	us := p.baseUS + m.PTS
-	advanceTimeline(us)
+	p.src.advance(us)
 
 	p.video.WriteRTP(&rtp.Packet{
 		Header:  rtp.Header{Timestamp: uint32(us * 9 / 100)}, // µs to 90 kHz
@@ -470,20 +532,35 @@ func (p *Producer) handleVideo(m *Media) (bool, error) {
 	return true, nil
 }
 
-// advanceTimeline records how far the process timeline has been used.
-func advanceTimeline(us uint64) {
-	for end := timelineEnd.Load(); us > end && !timelineEnd.CompareAndSwap(end, us); end = timelineEnd.Load() {
+// selfContained puts the current parameter sets in front of a keyframe that
+// lacks some of them. Consumers that were moved here from an earlier producer
+// carry repair code that adds the sets they saw first to such keyframes; with
+// the current ones in-band that never happens.
+func (p *Producer) selfContained(nals []nalUnit) []byte {
+	out := canonicalSets(p.params, p.hevc)
+	for _, n := range nals {
+		if !isParam(n.typ, p.hevc) {
+			out = binary.BigEndian.AppendUint32(out, uint32(len(n.data)))
+			out = append(out, n.data...)
+		}
+	}
+	return out
+}
+
+// advance records how far the source's timeline has been used.
+func (s *sourceState) advance(us uint64) {
+	for end := s.endUS.Load(); us > end && !s.endUS.CompareAndSwap(end, us); end = s.endUS.Load() {
 	}
 }
 
-// setBase puts this producer's camera clock on the process timeline: now, but
-// never before the end of what earlier producers sent.
+// setBase puts this producer's camera clock on the source's timeline: now, but
+// never before the end of what earlier producers of the source sent.
 func (p *Producer) setBase() {
 	if p.based {
 		return
 	}
 	p.based = true
-	p.baseUS = max(uint64(time.Since(processStart)/time.Microsecond), timelineEnd.Load()+timelineGap)
+	p.baseUS = max(uint64(time.Since(processStart)/time.Microsecond), p.src.endUS.Load()+timelineGap)
 }
 
 // audioTS is the RTP timestamp of the audio frame's position pos on the
@@ -493,11 +570,14 @@ func (p *Producer) audioTS(rate uint32, pos uint64) uint32 {
 	return uint32(p.baseUS*uint64(rate)/1_000_000 + pos)
 }
 
-// audioEnd moves the process timeline to the end of an audio frame, so a
-// replacement producer continues after the audio too.
+// audioEnd moves the timeline to the end of an audio frame, so a replacement
+// producer continues after the audio too.
 func (p *Producer) audioEnd(rate uint32, pos, samples uint64) {
-	advanceTimeline(p.baseUS + (pos+samples)*1_000_000/uint64(rate))
+	p.src.advance(p.baseUS + (pos+samples)*1_000_000/uint64(rate))
 }
+
+// nextSeq is the next audio RTP sequence number of the source.
+func (p *Producer) nextSeq() uint16 { return uint16(p.src.seq.Add(1)) }
 
 // writeAAC sends each ADTS frame as one standard RFC 3640 packet (AU headers
 // section, one access unit), with the timestamps of the stream's audio clock.
@@ -521,13 +601,12 @@ func (p *Producer) writeAAC(m *Media) (bool, error) {
 		binary.BigEndian.PutUint16(payload[2:], uint16(len(au))<<3)
 		copy(payload[4:], au)
 
-		p.audioSeq++
 		p.audio.WriteRTP(&rtp.Packet{
 			Header: rtp.Header{
 				Version:        2,
 				Marker:         true,
 				PayloadType:    aacPayloadType,
-				SequenceNumber: p.audioSeq,
+				SequenceNumber: p.nextSeq(),
 				Timestamp:      p.audioTS(info.rate, pos),
 			},
 			Payload: payload,
@@ -549,12 +628,11 @@ func (p *Producer) writeADPCM(m *Media) (bool, error) {
 		payload[i] = pcm.PCMtoPCMA(s)
 	}
 
-	p.audioSeq++
 	p.audio.WriteRTP(&rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
 			Marker:         true,
-			SequenceNumber: p.audioSeq,
+			SequenceNumber: p.nextSeq(),
 			Timestamp:      p.audioTS(adpcmSampleRate, m.AudioPos),
 		},
 		Payload: payload,

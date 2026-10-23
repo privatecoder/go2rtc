@@ -307,7 +307,7 @@ func (t *talker) run() {
 			t.abortSession()
 			return
 		case <-clientDone:
-			t.session = nil
+			t.dropSession() // nobody to reset, but the session object and its slot are freed
 			return
 
 		case <-t.closeReq:
@@ -367,10 +367,14 @@ func (t *talker) handleAudio(g []byte, idle *time.Timer) bool {
 
 	perBlock := ADPCMSamples(t.session.DataBytes)
 	for t.session != nil && len(t.samples) >= perBlock {
-		if !t.sendBlock(t.samples[:perBlock]) {
-			return !t.canceled()
-		}
+		chunk := t.samples[:perBlock]
 		t.samples = t.samples[perBlock:]
+		if !t.sendBlock(chunk) {
+			if t.canceled() {
+				return false
+			}
+			t.failSession() // the camera refused, the transport is fine
+		}
 	}
 	return true
 }
@@ -437,8 +441,16 @@ func (t *talker) sleepUntil(at time.Time) bool {
 	}
 }
 
-// sendBlock encodes one block of samples (padded if short) and sends it when
-// the previous block has played: the camera buffers little, so never a burst.
+// talkStale: a block that took this long to be written means the transport
+// stalled; the audio queued meanwhile is old and is dropped rather than
+// played as a burst afterwards.
+var talkStale = 500 * time.Millisecond
+
+// sendBlock encodes one block of samples (padded if short), sends it when the
+// previous block has played and waits until the transport has written it. The
+// playback deadline of the block counts from that write, so a stalled writer
+// can neither make the blocks arrive in a burst nor let the final reset cut
+// off what has just been delivered. Only one block is ever queued.
 func (t *talker) sendBlock(samples []int16) bool {
 	block, err := t.enc.EncodeBlock(samples, t.session.DataBytes)
 	if err != nil {
@@ -447,22 +459,47 @@ func (t *talker) sendBlock(samples []int16) bool {
 	if !t.sleepUntil(t.next) {
 		return false
 	}
-	now := time.Now()
-	if err = t.session.Send(block); err != nil {
+	start := time.Now()
+	written, err := t.session.SendNotify(block)
+	if err != nil {
 		if !errors.Is(err, ErrTalkStopped) {
 			t.p.client.cfg.Log.Warnf("talk: %v", err)
 		}
-		t.dropSession()
 		return false
 	}
+	select {
+	case <-written:
+	case <-t.cancel:
+		return false
+	case <-t.p.client.Done():
+		return false
+	}
+
+	now := time.Now()
 	t.next = now.Add(t.blockDuration())
 	t.p.talkSent.Add(int64(len(block)))
+	if now.Sub(start) > talkStale {
+		t.discardBacklog()
+	}
 	return true
+}
+
+// discardBacklog drops the microphone audio that piled up during a stall.
+func (t *talker) discardBacklog() {
+	t.samples = t.samples[:0]
+	for {
+		select {
+		case <-t.in:
+		default:
+			return
+		}
+	}
 }
 
 // endSession ends the camera session. Gracefully the rest of the audio goes
 // out as a final padded block and the reset waits until it has played (plus a
-// margin), like neolink's talk_stream; a reset would cut it off.
+// margin), like neolink's talk_stream; a reset would cut it off. The session
+// keeps the camera's slot until the reset has been answered.
 func (t *talker) endSession(graceful bool) {
 	s := t.session
 	if s == nil {
@@ -470,13 +507,18 @@ func (t *talker) endSession(graceful bool) {
 	}
 
 	if graceful {
+		ok := true
 		if len(t.samples) > 0 && !s.Stopped() {
-			if !t.sendBlock(t.samples) {
+			chunk := t.samples
+			t.samples = nil
+			ok = t.sendBlock(chunk)
+			if !ok && t.canceled() {
 				t.abortSession()
 				return
 			}
 		}
-		if !t.sleepUntil(t.next.Add(talkDrain)) {
+		// after a refused block there is nothing left to play
+		if ok && !t.sleepUntil(t.next.Add(talkDrain)) {
 			t.abortSession()
 			return
 		}
@@ -487,6 +529,11 @@ func (t *talker) endSession(graceful bool) {
 	_ = s.StopCancel(2*time.Second, t.cancel)
 	t.h.release(t)
 }
+
+// failSession ends a session after an error on a healthy transport: the
+// ordered stop, not the forced one, so the next session starts after the
+// camera answered the reset.
+func (t *talker) failSession() { t.endSession(false) }
 
 // dropSession ends a session that failed.
 func (t *talker) dropSession() {

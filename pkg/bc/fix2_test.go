@@ -464,10 +464,15 @@ func TestStreamClocksSurviveDrops(t *testing.T) {
 func TestAudioClockAnchorsOnVideo(t *testing.T) {
 	var a audioClock
 	// first audio after 2.5 s of video, 16 kHz
-	require.Equal(t, uint64(40000), a.next(16000, 1024, 2_500_000))
-	require.Equal(t, uint64(41024), a.next(16000, 1024, 3_000_000), "no re-anchoring")
+	pos, re := a.next(16000, 1024, 2_500_000, true)
+	require.Equal(t, uint64(40000), pos)
+	require.False(t, re)
+	pos, re = a.next(16000, 1024, 3_000_000, true)
+	require.Equal(t, uint64(41024), pos, "no re-anchoring")
+	require.False(t, re)
 	// another sample rate starts a new timeline
-	require.Equal(t, uint64(8000*3), a.next(8000, 480, 3_000_000))
+	pos, _ = a.next(8000, 480, 3_000_000, true)
+	require.Equal(t, uint64(8000*3), pos)
 }
 
 func TestParseADTS(t *testing.T) {
@@ -577,8 +582,9 @@ func TestTimelineContinuesAcrossProducers(t *testing.T) {
 	require.Equal(t, uint32(480), a1[1].Timestamp-a1[0].Timestamp)
 
 	// even if the process clock is behind what a camera clock produced
-	timelineEnd.Store(timelineEnd.Load() + 3_600_000_000) // one hour ahead
-	end := timelineEnd.Load()
+	src := sourceOf("bc://test")
+	src.endUS.Store(src.endUS.Load() + 3_600_000_000) // one hour ahead
+	end := src.endUS.Load()
 	v3, _ := run()
 	require.Greater(t, uint64(v3[0].Timestamp), end*9/100)
 }

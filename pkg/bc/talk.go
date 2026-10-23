@@ -254,6 +254,10 @@ func (t *Talk) watchAcks() {
 			}
 		case <-t.ended:
 			return
+		case <-t.c.done:
+			// the transport is gone, nobody will answer a reset: free the slot
+			t.finish()
+			return
 		}
 	}
 }
@@ -275,15 +279,23 @@ func (t *Talk) Ended() <-chan struct{} { return t.ended }
 // negotiated 4 + DataBytes bytes with a valid step index. The caller paces
 // it, the camera buffers little. Nothing is sent when it returns an error.
 func (t *Talk) Send(block []byte) error {
+	_, err := t.SendNotify(block)
+	return err
+}
+
+// SendNotify is Send that also returns a channel which is closed when the
+// transport has actually written the block, so that a sender can pace on the
+// real output and not on the queue. It stays open if the client fails first.
+func (t *Talk) SendNotify(block []byte) (<-chan struct{}, error) {
 	if len(block) != adpcmHeaderLen+t.DataBytes {
-		return fmt.Errorf("bc: talk block is %d bytes, the camera asked for %d", len(block), adpcmHeaderLen+t.DataBytes)
+		return nil, fmt.Errorf("bc: talk block is %d bytes, the camera asked for %d", len(block), adpcmHeaderLen+t.DataBytes)
 	}
 	if block[2] > 88 {
-		return fmt.Errorf("bc: talk block with step index %d", block[2])
+		return nil, fmt.Errorf("bc: talk block with step index %d", block[2])
 	}
 	frame, err := MarshalTalk(block)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ext := NewExtension()
 	ext.ChannelID = &t.c.cfg.Channel
@@ -293,12 +305,12 @@ func (t *Talk) Send(block []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.state != talkActive {
-		return ErrTalkStopped
+		return nil, ErrTalkStopped
 	}
 	if t.rejectErr != nil {
-		return t.rejectErr
+		return nil, t.rejectErr
 	}
-	return t.c.send(&Message{
+	return t.c.sendNotify(&Message{
 		MsgID: MsgTalk, ChannelID: t.c.cfg.Channel, MsgNum: t.num, Class: ClassModern24,
 		Extension: ext, Binary: frame,
 	})

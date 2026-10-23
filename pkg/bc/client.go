@@ -260,8 +260,9 @@ func (c *Client) fail(err error) {
 
 // outItem is one encoded message for the writer, or a flush marker.
 type outItem struct {
-	b     []byte
-	flush chan struct{}
+	b       []byte
+	flush   chan struct{}
+	written chan struct{} // closed when the datagram was written, if asked for
 }
 
 // freeNumLocked takes the next msg_num that nothing uses: not an active
@@ -287,6 +288,20 @@ func (c *Client) freeNum() uint16 {
 func (c *Client) send(m *Message) error { return c.enqueue(c.out, m) }
 
 func (c *Client) enqueue(q chan outItem, m *Message) error {
+	return c.enqueueNotify(q, m, nil)
+}
+
+// sendNotify is send with a channel that is closed once the writer has
+// written the message. If the client fails first it is never closed.
+func (c *Client) sendNotify(m *Message) (<-chan struct{}, error) {
+	written := make(chan struct{})
+	if err := c.enqueueNotify(c.out, m, written); err != nil {
+		return nil, err
+	}
+	return written, nil
+}
+
+func (c *Client) enqueueNotify(q chan outItem, m *Message, written chan struct{}) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 
@@ -301,7 +316,7 @@ func (c *Client) enqueue(q chan outItem, m *Message) error {
 		return err
 	}
 	select {
-	case q <- outItem{b: b}:
+	case q <- outItem{b: b, written: written}:
 		return nil
 	default:
 		c.fail(ErrWriteQueue)
@@ -357,6 +372,9 @@ func (c *Client) writeLoop() {
 		if err != nil {
 			c.fail(err)
 			return
+		}
+		if it.written != nil {
+			close(it.written)
 		}
 	}
 }
@@ -739,14 +757,22 @@ func (s *Stream) stamp(m *Media) {
 	case KindAAC:
 		if info, ok := parseADTS(m.Data); ok {
 			m.AudioRate = info.rate
-			m.AudioPos = s.audio.next(info.rate, info.samples, s.vclock.acc)
+			s.stampAudio(m, info.rate, info.samples)
 		}
 
 	case KindADPCM:
 		if n := len(m.Data) - adpcmHeaderLen; n > 0 {
 			m.AudioRate = adpcmSampleRate
-			m.AudioPos = s.audio.next(adpcmSampleRate, uint64(2*n), s.vclock.acc)
+			s.stampAudio(m, adpcmSampleRate, uint64(2*n))
 		}
+	}
+}
+
+func (s *Stream) stampAudio(m *Media, rate uint32, samples uint64) {
+	pos, re := s.audio.next(rate, samples, s.vclock.acc, s.vclock.started)
+	m.AudioPos = pos
+	if re {
+		s.c.cfg.Log.Debugf("audio clock put back on the video clock (frames were lost)")
 	}
 }
 

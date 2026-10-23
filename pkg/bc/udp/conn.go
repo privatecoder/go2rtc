@@ -144,7 +144,6 @@ type Conn struct {
 
 	stats Stats
 
-	logq chan func() // diagnostics run on their own goroutine, a slow sink stalls nothing
 	done chan struct{}
 }
 
@@ -165,7 +164,6 @@ func newConn(s *sock, own bool, peer netip.AddrPort, cid, did int32, cfg ConnCon
 		recvd:    map[uint32][]byte{},
 		lastRx:   now,
 		rateFrom: now,
-		logq:     make(chan func(), 32),
 		done:     make(chan struct{}),
 	}
 	c.cond = sync.NewCond(&c.mu)
@@ -175,28 +173,7 @@ func newConn(s *sock, own bool, peer netip.AddrPort, cid, did int32, cfg ConnCon
 	s.rebound.Store(&rebound)
 
 	go c.run()
-	go c.logLoop()
 	return c
-}
-
-// logAsync queues a diagnostic. It never blocks and is never called with the
-// mutex held; when the sink cannot keep up, messages are dropped.
-func (c *Conn) logAsync(f func()) {
-	select {
-	case c.logq <- f:
-	default:
-	}
-}
-
-func (c *Conn) logLoop() {
-	for {
-		select {
-		case f := <-c.logq:
-			f()
-		case <-c.done:
-			return
-		}
-	}
 }
 
 func (c *Conn) LocalAddr() net.Addr { return c.sock.conn().LocalAddr() }
@@ -298,7 +275,7 @@ func (c *Conn) endForSequence() {
 	already := c.closed
 	c.mu.Unlock()
 	if !already {
-		c.logAsync(func() { c.cfg.Log.Infof("planned reconnect before the packet-id boundary") })
+		emit(c.cfg.Log.Infof, "planned reconnect before the packet-id boundary")
 	}
 	c.finish(ErrSequenceLimit, true)
 }
@@ -633,7 +610,7 @@ func (c *Conn) run() {
 				return
 			}
 			if gap != "" {
-				c.logAsync(func() { c.cfg.Log.Warnf("%s", gap) })
+				emit(c.cfg.Log.Warnf, "%s", gap)
 			}
 
 			wire, _ := ack.Marshal()

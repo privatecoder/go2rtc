@@ -70,7 +70,7 @@ type Options struct {
 	ResendWait   time.Duration    // requests are repeated, 500 ms
 	MapTimeout   time.Duration    // the relay method waits this long for the punch, 3 s
 	BackoffBase  time.Duration    // registration retry delay, 1 s doubling
-	BackoffMax   time.Duration    // 60 s
+	BackoffMax   time.Duration    // 30 s
 	NoCache      bool             // no lookup cache
 }
 
@@ -122,7 +122,7 @@ func (o *Options) setDefaults() {
 		o.BackoffBase = time.Second
 	}
 	if o.BackoffMax == 0 {
-		o.BackoffMax = 60 * time.Second
+		o.BackoffMax = 30 * time.Second
 	}
 	if o.Conn.Log.empty() {
 		o.Conn.Log = o.Log
@@ -261,7 +261,8 @@ func Discover(ctx context.Context, uid string, opts Options) (*Conn, error) {
 	}
 	out := make(chan outcome, 2)
 	paths := 0
-	var counted atomic.Bool // this call already added to the cooldown
+	var counted atomic.Bool   // this call already added to the cooldown
+	var attempted atomic.Bool // this call really contacted the servers
 
 	// LAN
 	paths++
@@ -282,7 +283,7 @@ func Discover(ctx context.Context, uid string, opts Options) (*Conn, error) {
 	if wantRemote {
 		paths++
 		go func() {
-			s, reg, err := registerLoop(ctx, uid, o, &counted)
+			s, reg, err := registerLoop(ctx, uid, o, &counted, &attempted)
 			if err != nil {
 				out <- outcome{err: err}
 				return
@@ -320,13 +321,20 @@ func Discover(ctx context.Context, uid string, opts Options) (*Conn, error) {
 	}
 
 	if winner == nil {
+		joined := errors.Join(errs...)
+		var cd *CooldownError
+		if errors.As(joined, &cd) && !attempted.Load() {
+			return nil, cd // only waited: no failure of the camera, nothing to count
+		}
+
 		err := parent.Err()
 		if err == nil {
-			err = fmt.Errorf("udp: camera %s not reachable: %w", uid, errors.Join(errs...))
+			err = fmt.Errorf("udp: camera %s not reachable: %w", uid, joined)
 		}
-		// running out of time is a failed attempt like any other and counts for
-		// the cooldown (once per call); only a cancel by the caller is exempt
-		if !errors.Is(err, context.Canceled) && !counted.Load() && o.Method != MethodLocal {
+		// running out of time after the servers were contacted is a failed
+		// attempt like any other and counts for the cooldown (once per call);
+		// a cancel by the caller is exempt, and so is a call that only waited
+		if !errors.Is(err, context.Canceled) && !counted.Load() && attempted.Load() && o.Method != MethodLocal {
 			cooldownFail(uid, o)
 		}
 		return nil, err
@@ -349,11 +357,15 @@ func Discover(ctx context.Context, uid string, opts Options) (*Conn, error) {
 // registerLoop registers with the Reolink servers, again and again with a
 // growing delay: the servers only learn about a new connection attempt lazily
 // and the first tries fail.
-func registerLoop(ctx context.Context, uid string, o *Options, counted *atomic.Bool) (*session, *regResult, error) {
+func registerLoop(ctx context.Context, uid string, o *Options, counted, attempted *atomic.Bool) (*session, *regResult, error) {
 	for {
 		// the cooldown is looked at again after every wait: another call for the
 		// same camera may have extended it meanwhile
 		for wait := cooldownWait(uid); wait > 0; wait = cooldownWait(uid) {
+			// no point in spending the whole call on waiting
+			if dl, ok := ctx.Deadline(); ok && wait > time.Until(dl) {
+				return nil, nil, &CooldownError{Wait: wait}
+			}
 			o.Log.Debugf("waiting %s before contacting the Reolink servers again", wait.Round(time.Millisecond))
 			select {
 			case <-time.After(wait):
@@ -362,6 +374,7 @@ func registerLoop(ctx context.Context, uid string, o *Options, counted *atomic.B
 			}
 		}
 
+		attempted.Store(true)
 		s, err := newSession(o)
 		if err != nil {
 			return nil, nil, err
@@ -525,6 +538,11 @@ func request[T any](ctx context.Context, s *session, d *Discovery, to netip.Addr
 		d.TID, ch, unsub, err = s.subscribeNew()
 	} else {
 		ch, unsub, err = s.subscribe(d.TID)
+		if err != nil && anyTid {
+			// the camera chose this tid and an unrelated request has it: the
+			// answer is found by its content among what the listeners get
+			ch, unsub, err = nil, func() {}, nil
+		}
 	}
 	if err != nil {
 		return zero, err
@@ -571,6 +589,15 @@ func ctxErr(ctx context.Context) error {
 		return ErrNoReply
 	}
 	return ctx.Err()
+}
+
+// CooldownError is returned when an earlier failure for the same camera still
+// holds the servers off for longer than the call may take. Nothing was sent
+// and nothing is counted as a new failure; the caller retries later.
+type CooldownError struct{ Wait time.Duration }
+
+func (e *CooldownError) Error() string {
+	return fmt.Sprintf("udp: waiting for the P2P cooldown, retry in %s", e.Wait.Round(time.Second))
 }
 
 var (

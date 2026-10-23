@@ -560,8 +560,13 @@ func (v *videoClock) next(us uint32) uint64 {
 	return v.acc
 }
 
+// maxAudioDrift is how far the audio clock may run from the video clock
+// before it is put back on it. Frames the transport gave up on (UDP gap skips)
+// carry no duration, so over a long session audio would drift earlier.
+const maxAudioDrift = 500_000 // µs
+
 // audioClock paces audio by its own content duration. Audio has no camera
-// timestamp, it is anchored once to the video clock and then advances by the
+// timestamp, it is anchored to the video clock and then advances by the
 // samples of every frame, delivered or not.
 type audioClock struct {
 	on   bool
@@ -570,15 +575,23 @@ type audioClock struct {
 }
 
 // next returns the position of a frame of the given samples and advances.
-// videoUS is the video clock at that moment, used when (re)anchoring.
-func (a *audioClock) next(rate uint32, samples, videoUS uint64) uint64 {
-	if !a.on || a.rate != rate {
+// videoUS is the video clock at that moment (videoOK: there is video), used
+// when (re)anchoring. reanchored tells that the clock was put back on video.
+func (a *audioClock) next(rate uint32, samples, videoUS uint64, videoOK bool) (pos uint64, reanchored bool) {
+	switch {
+	case !a.on || a.rate != rate:
 		a.on, a.rate = true, rate
 		a.pos = videoUS * uint64(rate) / 1_000_000
+	case videoOK:
+		audioUS := a.pos * 1_000_000 / uint64(rate)
+		if drift := max(audioUS, videoUS) - min(audioUS, videoUS); drift > maxAudioDrift {
+			a.pos = videoUS * uint64(rate) / 1_000_000
+			reanchored = true
+		}
 	}
-	pos := a.pos
+	pos = a.pos
 	a.pos += samples
-	return pos
+	return pos, reanchored
 }
 
 var adtsRates = [13]uint32{96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350}
