@@ -62,6 +62,15 @@ type fakeCamera struct {
 	replies  chan *Message // client messages with msg id 234
 	started  chan struct{}
 
+	// PTZ: a camera without PTZ has ptzType 0 and refuses msg 294
+	noPTZ   bool
+	zoomMax uint32 // 33 if 0
+	zoomCur uint32
+	presets []Preset
+	logins  int // modern logins accepted
+	accepts int // connections accepted by a multi fake
+	closed  int // connections of a multi fake that ended
+
 	loginCodes []uint16        // response codes of the legacy login requests
 	videoReq   *Message        // the stream start request, media goes out under its msg_num
 	binSent    bool            // the first media message carried the binary-mode extension
@@ -106,6 +115,39 @@ func newFakeCamera(t *testing.T) *fakeCamera {
 	f.ln = ln
 	go f.serve()
 	return f
+}
+
+// newMultiFake accepts one connection after the other, with fresh codec state
+// for each. accepts and closed count them.
+func newMultiFake(t *testing.T) *fakeCamera {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	f := newBareFake(t)
+	f.ln = ln
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			f.mu.Lock()
+			f.accepts++
+			f.codec = NewCodec(fakePass)
+			f.mu.Unlock()
+			f.serveConn(conn)
+			f.mu.Lock()
+			f.closed++
+			f.mu.Unlock()
+		}
+	}()
+	return f
+}
+
+func (f *fakeCamera) count(n *int) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return *n
 }
 
 func (f *fakeCamera) addr() string { return f.ln.Addr().String() }
@@ -198,6 +240,9 @@ func (f *fakeCamera) serveConn(conn io.ReadWriteCloser) {
 				f.write(reply(m, 400))
 				continue
 			}
+			f.mu.Lock()
+			f.logins++
+			f.mu.Unlock()
 			r := reply(m, 200)
 			r.Body = &Body{DeviceInfo: &DeviceInfo{
 				Version: XMLVersion, Resolution: &Resolution{Name: "2560*1440", Width: 2560, Height: 1440},
@@ -290,6 +335,9 @@ func (f *fakeCamera) serveConn(conn io.ReadWriteCloser) {
 				code = 200
 			}
 			f.write(reply(m, code))
+
+		case MsgPTZControl, MsgPTZPreset, MsgGetPTZPreset, MsgGetSupport, MsgGetZoomFocus, MsgSetZoomFocus:
+			f.servePTZ(m)
 
 		case MsgVideoStop:
 			f.mu.Lock()
@@ -411,4 +459,77 @@ func (f *fakeCamera) violationList() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.violations...)
+}
+
+func (f *fakeCamera) loginCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.logins
+}
+
+// ptzEvent records in the same list as the talk events.
+func (f *fakeCamera) ptzEvent(format string, args ...any) {
+	f.talkEvents = append(f.talkEvents, fmt.Sprintf(format, args...))
+	f.eventAt = append(f.eventAt, time.Now())
+}
+
+func (f *fakeCamera) servePTZ(m *Message) {
+	f.mu.Lock()
+	r := reply(m, 200)
+	switch m.MsgID {
+	case MsgPTZControl:
+		c := m.Body.PtzControl
+		f.ptzEvent("ptz:%s:%g", c.Command, c.Speed)
+
+	case MsgPTZPreset:
+		p := m.Body.PtzPreset.PresetList.Presets[0]
+		f.ptzEvent("preset:%s:%d", p.Command, p.ID)
+		i := 0
+		for i < len(f.presets) && f.presets[i].ID != p.ID {
+			i++
+		}
+		switch p.Command {
+		case "setPos":
+			if i == len(f.presets) {
+				f.presets = append(f.presets, Preset{ID: p.ID})
+			}
+			f.presets[i].Name = p.Name
+		case "toPos":
+			if i == len(f.presets) {
+				r.ResponseCode = 400
+			}
+		}
+
+	case MsgGetPTZPreset:
+		list := make([]Preset, len(f.presets))
+		copy(list, f.presets)
+		r.Body = &Body{PtzPreset: &PtzPreset{Version: XMLVersion, PresetList: PresetList{Presets: list}}}
+
+	case MsgGetSupport:
+		var t uint32 = 1
+		if f.noPTZ {
+			t = 0
+		}
+		r.Body = &Body{Support: &Support{Version: XMLVersion, Items: []SupportItem{{ChnID: uint32(m.ChannelID), PtzType: &t}}}}
+
+	case MsgGetZoomFocus:
+		if f.noPTZ {
+			r.ResponseCode = 400
+			break
+		}
+		max := f.zoomMax
+		if max == 0 {
+			max = 33
+		}
+		r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{
+			Version: XMLVersion, Zoom: ZoomPos{Max: max, Cur: f.zoomCur}, Focus: ZoomPos{Max: 100},
+		}}
+
+	case MsgSetZoomFocus:
+		pos := m.Body.StartZoomFocus.MovePos
+		f.ptzEvent("zoom:%d", pos)
+		f.zoomCur = pos
+	}
+	f.mu.Unlock()
+	f.write(r)
 }

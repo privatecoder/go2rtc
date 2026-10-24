@@ -24,6 +24,12 @@ type Body struct {
 	TalkConfig  *TalkConfig  `xml:"TalkConfig,omitempty"`
 	TalkAbility *TalkAbility `xml:"TalkAbility,omitempty"`
 	LinkType    *LinkType    `xml:"LinkType,omitempty"`
+
+	PtzControl     *PtzControl     `xml:"PtzControl,omitempty"`
+	PtzPreset      *PtzPreset      `xml:"PtzPreset,omitempty"`
+	PtzZoomFocus   *PtzZoomFocus   `xml:"PtzZoomFocus,omitempty"`
+	StartZoomFocus *StartZoomFocus `xml:"StartZoomFocus,omitempty"`
+	Support        *Support        `xml:"Support,omitempty"`
 }
 
 // LinkType is the reply to a ping (msg 93).
