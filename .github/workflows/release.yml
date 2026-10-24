@@ -95,6 +95,7 @@ jobs:
 
       - name: Build and push
         uses: docker/build-push-action@v7
+        env: { DOCKER_BUILD_RECORD_UPLOAD: false }
         with:
           context: .
           file: docker/Dockerfile
@@ -115,7 +116,7 @@ jobs:
 
       - name: Download binaries
         uses: actions/download-artifact@v8
-        with: { path: dist, merge-multiple: true }
+        with: { path: dist, pattern: 'go2rtc_*', merge-multiple: true }
 
       - name: Checksums
         run: cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt
