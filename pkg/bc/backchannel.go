@@ -234,6 +234,11 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 	if p.talkCfg == nil {
 		return errors.New("bc: camera does not support talk")
 	}
+	if track.Codec.Name == core.CodecAny {
+		// a probe (e.g. Frigate's ?microphone check) only asks whether talk
+		// exists; it never sends audio, so there is nothing to attach
+		return nil
+	}
 
 	t := &talker{
 		h: p.hub, p: p, cfg: *p.talkCfg, srcRate: track.Codec.ClockRate,

@@ -548,3 +548,16 @@ func TestDuplicateSPSWithoutPPSIsCompleted(t *testing.T) {
 	}
 	require.Contains(t, types, byte(8), "PPS added: %v", types)
 }
+
+// a probe asking for a microphone of any codec is accepted without a talker
+func TestProbeMicrophoneAnyCodec(t *testing.T) {
+	f := newFakeCamera(t)
+	f.talkAbility = adpcmAbility(8000, 400)
+	p := newTalkProducer(t, f)
+	back := p.GetMedias()[2]
+
+	probe := core.NewReceiver(nil, &core.Codec{Name: core.CodecAny})
+	require.NoError(t, p.AddTrack(back, probe.Codec, probe))
+	require.Empty(t, p.Senders)
+	require.Empty(t, f.sessionEvents())
+}
