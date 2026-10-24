@@ -15,4 +15,7 @@ func Init() {
 	}
 
 	streams.HandleFunc("bc", bc.Dial)
+
+	// the streams are loaded by now
+	go prefetchPTZ()
 }
