@@ -1,3 +1,6 @@
+> **This fork** (privatecoder/go2rtc, with the Baichuan `bc://` source) publishes only `ghcr.io/privatecoder/go2rtc:<version>`
+> and `:latest`, alpine-based, for `linux/amd64` and `linux/arm64`. The images and variants listed below are upstream's.
+
 # Docker
 
 Images are built automatically via [GitHub actions](https://github.com/AlexxIT/go2rtc/actions) and published on [Docker Hub](https://hub.docker.com/r/alexxit/go2rtc) and [GitHub](https://github.com/AlexxIT/go2rtc/pkgs/container/go2rtc).

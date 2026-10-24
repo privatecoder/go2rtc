@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   test:
@@ -33,19 +34,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - { name: go2rtc_win64,         goos: windows, goarch: amd64, zip: true }
-          - { name: go2rtc_win32,         goos: windows, goarch: '386', zip: true }
-          - { name: go2rtc_win_arm64,     goos: windows, goarch: arm64, zip: true }
-          - { name: go2rtc_linux_amd64,   goos: linux,   goarch: amd64 }
-          - { name: go2rtc_linux_i386,    goos: linux,   goarch: '386' }
-          - { name: go2rtc_linux_arm64,   goos: linux,   goarch: arm64 }
-          - { name: go2rtc_linux_arm,     goos: linux,   goarch: arm, goarm: '7' }
-          - { name: go2rtc_linux_armv6,   goos: linux,   goarch: arm, goarm: '6' }
-          - { name: go2rtc_linux_mipsel,  goos: linux,   goarch: mipsle }
-          - { name: go2rtc_mac_amd64,     goos: darwin,  goarch: amd64, zip: true }
-          - { name: go2rtc_mac_arm64,     goos: darwin,  goarch: arm64, zip: true }
-          - { name: go2rtc_freebsd_amd64, goos: freebsd, goarch: amd64 }
-          - { name: go2rtc_freebsd_arm64, goos: freebsd, goarch: arm64 }
+          - { name: go2rtc_linux_amd64, goos: linux,  goarch: amd64 }
+          - { name: go2rtc_linux_arm64, goos: linux,  goarch: arm64 }
+          - { name: go2rtc_mac_arm64,   goos: darwin, goarch: arm64, zip: true }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -59,13 +50,11 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
         run: |
           mkdir dist
           if [ "${{ matrix.zip }}" = "true" ]; then
-            bin=go2rtc; [ "$GOOS" = windows ] && bin=go2rtc.exe
-            go build -ldflags "-s -w" -trimpath -o "$bin"
-            zip -9 "dist/${{ matrix.name }}.zip" "$bin"
+            go build -ldflags "-s -w" -trimpath -o go2rtc
+            zip -9 "dist/${{ matrix.name }}.zip" go2rtc
           else
             go build -ldflags "-s -w" -trimpath -o "dist/${{ matrix.name }}"
           fi
@@ -74,9 +63,51 @@ jobs:
         uses: actions/upload-artifact@v4
         with: { name: '${{ matrix.name }}', path: dist/* }
 
+  docker:
+    name: Docker image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=true
+          tags: type=match,pattern=v(.*),group=1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, docker]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -87,7 +118,7 @@ jobs:
         with: { path: dist, merge-multiple: true }
 
       - name: Checksums
-        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+        run: cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt
 
       - name: Create release
         env:
