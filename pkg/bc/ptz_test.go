@@ -1032,7 +1032,7 @@ func TestPTZFailedGotoPresetKeepsStopRetries(t *testing.T) {
 }
 
 func TestPTZFailedGotoPresetStopsRunningMove(t *testing.T) {
-	// the preset replaced a running move and its deadline: the camera is stopped instead
+	// the preset replaced a running move: when it fails the camera is stopped, not left to the deadline
 	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
 		if m.MsgID == MsgPTZPreset {
 			return reply(m, 400), 0
@@ -1060,4 +1060,164 @@ func TestPTZGotoPresetStopsZoomAndReplacesUnsentCommand(t *testing.T) {
 	require.Len(t, f.events(), n, "the zoom went on after the preset")
 
 	require.Error(t, p.GotoPreset(77)) // unknown to the camera
+}
+
+// Independent review probes loaded exclusively from /tmp.
+func TestPTZPendingPresetKeepsPanDeadline(t *testing.T) {
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		if m.MsgID == MsgPTZPreset {
+			return reply(m, 400), 250 * time.Millisecond
+		}
+		return ok(m)
+	})
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, 50*time.Millisecond))
+	require.True(t, isMove(next(t, seen)))
+	preset := make(chan error, 1)
+	go func() { preset <- p.GotoPreset(9) }()
+	require.EqualValues(t, MsgPTZPreset, next(t, seen).MsgID)
+	// The fake does not apply this invalid preset; it merely delays the refusal.
+	var stop *Message
+	select {
+	case stop = <-seen:
+	case <-time.After(130 * time.Millisecond):
+	}
+	err := <-preset
+	require.Error(t, err)
+	require.NotNil(t, stop, "old pan's 50ms watchdog was invalidated while a refused preset awaited its reply")
+	require.True(t, isStop(stop))
+}
+
+func TestPTZPresetWaitTimeoutKeepsStopObligation(t *testing.T) {
+	setVar(t, &moveWait, 50*time.Millisecond)
+	p, seen := wire(t, ok)
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, 70*time.Millisecond))
+	require.True(t, isMove(next(t, seen)))
+	old := p.ctrl
+	gate := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(gate) })
+	var startedOnce sync.Once
+	p.open = func() (*Client, error) {
+		startedOnce.Do(func() { close(started) })
+		<-gate
+		return nil, errors.New("simulated failed discovery")
+	}
+	_ = old.Close() // the camera's prior pan may continue after the session dies
+	preset := make(chan error, 1)
+	go func() { preset <- p.GotoPreset(9) }()
+	<-started
+	require.Error(t, <-preset)
+	time.Sleep(90 * time.Millisecond)
+	p.moveMu.Lock()
+	owed := p.stopWanted
+	may := p.mayMove
+	p.moveMu.Unlock()
+	once.Do(func() { close(gate) })
+	require.True(t, may)
+	require.True(t, owed, "preset returned a timeout but old Move's deadline no longer creates a Stop obligation during discovery")
+}
+
+func TestPTZFailedPresetRetainsSessionUntilStop(t *testing.T) {
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		if m.MsgID == MsgPTZPreset {
+			return reply(m, 400), 0
+		}
+		return ok(m)
+	})
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Second))
+	require.True(t, isMove(next(t, seen)))
+	q, other := wire(t, ok)
+	registerClient(p.key, q.ctrl)
+	require.Error(t, p.GotoPreset(9))
+	require.EqualValues(t, MsgPTZPreset, next(t, seen).MsgID)
+	require.True(t, isStop(next(t, seen)))
+	require.Empty(t, other)
+	require.Eventually(t, func() bool {
+		p.moveMu.Lock()
+		defer p.moveMu.Unlock()
+		return p.motion == nil && !p.mayMove && !p.stopWanted
+	}, time.Second, time.Millisecond)
+}
+
+type slowWriteConn struct {
+	net.Conn
+	delay time.Duration
+}
+
+func (c *slowWriteConn) Write(b []byte) (int, error) { time.Sleep(c.delay); return c.Conn.Write(b) }
+
+func TestPTZGiveUpDoesNotReleaseLiveQueuedMotion(t *testing.T) {
+	setVar(t, &stopBackoff, []time.Duration{5 * time.Millisecond})
+	setVar(t, &stopGiveUp, 40*time.Millisecond)
+	setVar(t, &stopWait, 10*time.Millisecond)
+	a, b := net.Pipe()
+	c := NewClient(&slowWriteConn{Conn: a, delay: 5 * time.Millisecond}, Config{ReplyTimeout: 10 * time.Millisecond, WriteTimeout: 30 * time.Millisecond})
+	p := newPTZ("give-up-live/"+t.Name(), "bc://unused.invalid")
+	p.ctrl = c
+	applied := make(chan *Message, 100)
+	go func() {
+		codec := NewCodec("")
+		reader := NewReader(b, codec)
+		for {
+			m, err := reader.ReadMessage()
+			if err != nil {
+				return
+			}
+			code := uint16(200)
+			if m.MsgID == MsgPTZControl {
+				applied <- m
+				if isStop(m) {
+					code = 400
+				}
+			}
+			raw, err := codec.Encode(reply(m, code))
+			if err != nil {
+				return
+			}
+			if _, err = b.Write(raw); err != nil {
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { endPTZ(p); _ = c.Close(); _ = b.Close() })
+	// Each transport write is below WriteTimeout, but aggregate queue delay
+	// exceeds the Stop retry budget. This keeps the session alive throughout.
+	for i := 0; i < 60; i++ {
+		require.NoError(t, c.send(&Message{MsgID: MsgPing, MsgNum: uint16(1000 + i), Class: ClassModern24}))
+	}
+	moved := make(chan error, 1)
+	go func() { moved <- p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Second) }()
+	require.Eventually(t, func() bool { p.moveMu.Lock(); defer p.moveMu.Unlock(); return p.motion == c }, time.Second, time.Millisecond)
+	_ = p.Stop(true, true)
+	require.Eventually(t, func() bool {
+		p.moveMu.Lock()
+		defer p.moveMu.Unlock()
+		return !p.looping && !p.mayMove && !p.stopWanted
+	}, time.Second, time.Millisecond)
+	select {
+	case <-c.Done():
+		t.Fatal("old session died; probe requires live queued writer")
+	default:
+	}
+	q, seen := wire(t, ok)
+	registerClient(p.key, q.ctrl) // a stream of the camera starts after the give-up
+
+	// the session stays pinned: the newer Move goes behind the older writes on
+	// the same session (its reply is late, a timeout here is expected) and not
+	// to the other session, where it could overtake them
+	_ = p.Move(Velocity{Pan: -1, HasPanTilt: true}, time.Second)
+	require.Empty(t, seen, "a motion command went to the other session while older motion may be queued")
+	p.moveMu.Lock()
+	pending := p.mayMove && p.timer != nil && p.motion == c
+	p.moveMu.Unlock()
+	require.True(t, pending, "newer Move not protected or session released")
+
+	// everything arrives on the old session in order
+	var cmds []string
+	for len(cmds) < 2 {
+		m := next(t, applied)
+		cmds = append(cmds, m.Body.PtzControl.Command)
+	}
+	require.Equal(t, "right", cmds[0])
 }

@@ -596,8 +596,8 @@ func (p *PTZ) run() {
 				continue
 			}
 			if time.Since(p.stopSince) > stopGiveUp {
-				p.mayMove, p.stopWanted, p.motion = false, false, nil
-				if p.stepper == nil { // a running zoom keeps its deadline
+				p.mayMove, p.stopWanted = false, false // the session stays pinned: older motion may still be queued on it
+				if p.stepper == nil {                  // a running zoom keeps its deadline
 					p.cancelTimerLocked()
 				}
 				p.moveMu.Unlock()
@@ -676,7 +676,12 @@ func (p *PTZ) send(cmd *panCmd, kick <-chan struct{}) {
 	_, err = call.wait(ctx.Done())
 	switch {
 	case errors.Is(err, ErrCanceled):
-		cmd.complete(nil) // replaced, the newer command goes on from here
+		if cmd.isPreset {
+			// sent, and a Stop or newer command took over before the answer
+			cmd.complete(errors.New("bc: ptz preset interrupted before it was acknowledged"))
+		} else {
+			cmd.complete(nil) // replaced, the newer command goes on from here
+		}
 	case err != nil:
 		p.failed(cmd, err)
 	default:
@@ -719,7 +724,7 @@ func (p *PTZ) failed(cmd *panCmd, err error) {
 		p.retryAt = time.Now().Add(stopBackoff[min(p.fails, len(stopBackoff)-1)])
 		p.fails++
 	case cmd.isPreset && p.mayMove && !p.stopWanted && p.desired == nil:
-		// the preset did not happen and the move it replaced lost its deadline
+		// the preset did not happen: stop the move it replaced now, not at its deadline
 		p.wantStopLocked()
 		p.setDesiredLocked(newPanCmd(DirStop, 0))
 	}
@@ -886,8 +891,7 @@ func (p *PTZ) GotoPreset(id uint8) error {
 	cmd.isPreset, cmd.preset = true, id
 
 	p.moveMu.Lock()
-	p.seq++
-	p.gen++
+	p.seq++ // gen stays: the move before keeps its safety deadline until the preset is acknowledged
 	p.cancelStepperLocked()
 	p.setDesiredLocked(cmd)
 	p.moveMu.Unlock()
