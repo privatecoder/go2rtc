@@ -348,21 +348,34 @@ func parseDuration(s string) (time.Duration, error) {
 }
 
 // ParseStop reads the ProfileToken and the PanTilt and Zoom flags, which are
-// true if absent (or if there is nothing to read).
-func ParseStop(b []byte) (token string, panTilt, zoom bool) {
+// true if absent (or if there is nothing to read). A flag must be true, false,
+// 1 or 0, anything else is an error.
+func ParseStop(b []byte) (token string, panTilt, zoom bool, err error) {
 	panTilt, zoom = true, true
-	fields, err := readFields(b)
-	if err != nil {
+	fields, ferr := readFields(b)
+	if ferr != nil {
 		return
 	}
 	token, _ = text(fields, "ProfileToken")
-	flag := func(name string, v *bool) {
-		if s, ok := text(fields, name); ok && s != "" {
-			*v = s == "true" || s == "1"
+	flag := func(name string, v *bool) error {
+		s, ok := text(fields, name)
+		if !ok {
+			return nil
 		}
+		switch s {
+		case "true", "1":
+			*v = true
+		case "false", "0":
+			*v = false
+		default:
+			return fmt.Errorf("onvif: bad %s flag %q", name, s)
+		}
+		return nil
 	}
-	flag("PanTilt", &panTilt)
-	flag("Zoom", &zoom)
+	if err = flag("PanTilt", &panTilt); err != nil {
+		return
+	}
+	err = flag("Zoom", &zoom)
 	return
 }
 

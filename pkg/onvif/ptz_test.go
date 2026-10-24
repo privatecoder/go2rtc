@@ -239,27 +239,43 @@ func TestParseTimeout(t *testing.T) {
 }
 
 func TestParseStopDefaults(t *testing.T) {
-	token, panTilt, zoom := ParseStop([]byte(`<E><B><ns0:Stop xmlns:ns0="x"><ns0:ProfileToken>cam</ns0:ProfileToken></ns0:Stop></B></E>`))
+	stop := func(body string) (string, bool, bool, error) {
+		return ParseStop([]byte(body))
+	}
+
+	token, panTilt, zoom, err := stop(`<E><B><ns0:Stop xmlns:ns0="x"><ns0:ProfileToken>cam</ns0:ProfileToken></ns0:Stop></B></E>`)
+	require.NoError(t, err)
 	require.Equal(t, "cam", token)
 	require.True(t, panTilt)
 	require.True(t, zoom)
 
-	_, panTilt, zoom = ParseStop([]byte(`<E><B><Stop><ProfileToken>cam</ProfileToken><PanTilt>true</PanTilt><Zoom>false</Zoom></Stop></B></E>`))
+	_, panTilt, zoom, err = stop(`<E><B><Stop><ProfileToken>cam</ProfileToken><PanTilt>true</PanTilt><Zoom>false</Zoom></Stop></B></E>`)
+	require.NoError(t, err)
 	require.True(t, panTilt)
 	require.False(t, zoom)
 
-	_, panTilt, zoom = ParseStop([]byte(`<E><B><Stop><ProfileToken>cam</ProfileToken><PanTilt>0</PanTilt><Zoom>1</Zoom></Stop></B></E>`))
+	_, panTilt, zoom, err = stop(`<E><B><Stop><ProfileToken>cam</ProfileToken><PanTilt>0</PanTilt><Zoom> 1 </Zoom></Stop></B></E>`)
+	require.NoError(t, err)
 	require.False(t, panTilt)
 	require.True(t, zoom)
 
 	// frigate: PanTilt and Zoom true
-	_, panTilt, zoom = ParseStop([]byte(`<E><B><ns0:Stop xmlns:ns0="x"><ns0:ProfileToken>cam</ns0:ProfileToken><ns0:PanTilt>true</ns0:PanTilt><ns0:Zoom>true</ns0:Zoom></ns0:Stop></B></E>`))
+	_, panTilt, zoom, err = stop(`<E><B><ns0:Stop xmlns:ns0="x"><ns0:ProfileToken>cam</ns0:ProfileToken><ns0:PanTilt>true</ns0:PanTilt><ns0:Zoom>true</ns0:Zoom></ns0:Stop></B></E>`)
+	require.NoError(t, err)
 	require.True(t, panTilt && zoom)
 
 	// nothing to read: the defaults
-	token, panTilt, zoom = ParseStop(nil)
+	token, panTilt, zoom, err = ParseStop(nil)
+	require.NoError(t, err)
 	require.Equal(t, "", token)
 	require.True(t, panTilt && zoom)
+
+	for _, bad := range []string{"tru", "yes", "TRUE", "", "2", "on"} {
+		_, _, _, err = stop(`<E><B><Stop><ProfileToken>cam</ProfileToken><PanTilt>` + bad + `</PanTilt></Stop></B></E>`)
+		require.Error(t, err, "PanTilt "+bad)
+		_, _, _, err = stop(`<E><B><Stop><ProfileToken>cam</ProfileToken><Zoom>` + bad + `</Zoom></Stop></B></E>`)
+		require.Error(t, err, "Zoom "+bad)
+	}
 }
 
 func TestParsePreset(t *testing.T) {

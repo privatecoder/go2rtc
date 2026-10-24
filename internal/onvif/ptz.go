@@ -55,9 +55,118 @@ func hasBCStreams() bool {
 	return false
 }
 
+// A camera whose abilities could not be read is not asked again for a while:
+// every GetProfiles would otherwise wait for it again and every retry could open
+// a control connection. The wait doubles up to the maximum and starts over after
+// a success.
+var (
+	capsBackoffMin = 30 * time.Second
+	capsBackoffMax = 5 * time.Minute
+	// capsFetchTimeout bounds one fetch, which goes on after a request has
+	// stopped waiting for it.
+	capsFetchTimeout = 60 * time.Second
+)
+
+// camState is what is known about the abilities of one camera, shared by all
+// streams that point to it.
+type camState struct {
+	mu      sync.Mutex
+	caps    *pkgbc.PTZCaps
+	pending chan struct{} // closed when the running fetch ends
+	until   time.Time     // no new fetch before
+	backoff time.Duration
+}
+
+var (
+	camStatesMu sync.Mutex
+	camStates   = map[string]*camState{}
+)
+
+func stateOf(source string) *camState {
+	key, err := pkgbc.CameraKey(source)
+	if err != nil {
+		key = source
+	}
+	camStatesMu.Lock()
+	defer camStatesMu.Unlock()
+	st := camStates[key]
+	if st == nil {
+		st = new(camState)
+		camStates[key] = st
+	}
+	return st
+}
+
+// resetCamStates forgets what is known about the cameras, for tests.
+func resetCamStates() {
+	camStatesMu.Lock()
+	camStates = map[string]*camState{}
+	camStatesMu.Unlock()
+}
+
+// capsOf is the abilities of the camera, waiting for them until ctx ends. ok is
+// false if they are not known: the camera failed lately (no wait at all then),
+// or the fetch is still running.
+func (st *camState) capsOf(ctx context.Context, name string, c ptzController) (caps pkgbc.PTZCaps, ok bool) {
+	st.mu.Lock()
+	if st.caps != nil {
+		caps = *st.caps
+		st.mu.Unlock()
+		return caps, true
+	}
+	if st.pending == nil {
+		if time.Now().Before(st.until) {
+			st.mu.Unlock()
+			return caps, false
+		}
+
+		done := make(chan struct{})
+		st.pending = done
+		// read here, the fetch may outlive the request
+		fetchTimeout, minBackoff, maxBackoff := capsFetchTimeout, capsBackoffMin, capsBackoffMax
+		go func() {
+			fctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+			defer cancel()
+			caps, err := c.Caps(fctx)
+
+			st.mu.Lock()
+			if err == nil {
+				st.caps, st.backoff = &caps, 0
+			} else {
+				log.Debug().Err(err).Msgf("[onvif] ptz caps stream=%s", name)
+				switch {
+				case st.backoff == 0:
+					st.backoff = minBackoff
+				default:
+					st.backoff = min(st.backoff*2, maxBackoff)
+				}
+				st.until = time.Now().Add(st.backoff)
+			}
+			st.pending = nil
+			st.mu.Unlock()
+			close(done)
+		}()
+	}
+	done := st.pending
+	st.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return caps, false
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.caps == nil {
+		return caps, false
+	}
+	return *st.caps, true
+}
+
 // ptzFeatures asks the cameras of the bc:// streams in names, all together
-// within wait. The cameras that did not answer in time are left out, their
-// request goes on and fills the cache.
+// within wait. The cameras that did not answer in time, or failed lately, are
+// left out; a slow request goes on and fills the cache.
 func ptzFeatures(names []string, wait time.Duration) map[string]onvif.PTZFeatures {
 	var mu sync.Mutex
 	result := map[string]onvif.PTZFeatures{}
@@ -82,12 +191,8 @@ func ptzFeatures(names []string, wait time.Duration) map[string]onvif.PTZFeature
 				log.Debug().Err(err).Msgf("[onvif] ptz stream=%s", name)
 				return
 			}
-			caps, err := c.Caps(ctx)
-			if err != nil {
-				log.Debug().Err(err).Msgf("[onvif] ptz caps stream=%s", name)
-				return
-			}
-			if caps.PanTilt || caps.Zoom {
+			caps, ok := stateOf(source).capsOf(ctx, name, c)
+			if ok && (caps.PanTilt || caps.Zoom) {
 				mu.Lock()
 				result[name] = onvif.PTZFeatures{PanTilt: caps.PanTilt, Zoom: caps.Zoom}
 				mu.Unlock()
@@ -95,20 +200,11 @@ func ptzFeatures(names []string, wait time.Duration) map[string]onvif.PTZFeature
 		}()
 	}
 
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-ctx.Done():
-	}
+	wg.Wait() // every capsOf ends with ctx at the latest
 
 	mu.Lock()
 	defer mu.Unlock()
-	out := make(map[string]onvif.PTZFeatures, len(result))
-	for k, v := range result {
-		out[k] = v
-	}
-	return out
+	return result
 }
 
 func writeSOAP(w http.ResponseWriter, status int, b []byte) {
@@ -117,6 +213,13 @@ func writeSOAP(w http.ResponseWriter, status int, b []byte) {
 	if _, err := w.Write(b); err != nil {
 		log.Error().Err(err).Caller().Send()
 	}
+}
+
+// controllerFault answers a failed camera command. The error stays in the log:
+// it can hold the camera's UID or address, and the caller is not authenticated.
+func controllerFault(w http.ResponseWriter, token string, err error) {
+	log.Debug().Err(err).Msgf("[onvif] ptz stream=%s", token)
+	fault(w, "Action", "camera not reachable")
 }
 
 func fault(w http.ResponseWriter, subcode, reason string) {
@@ -227,33 +330,38 @@ func ptzService(w http.ResponseWriter, r *http.Request, operation string, b []by
 			HasPanTilt: req.HasPanTilt, HasZoom: req.HasZoom,
 		}
 		if err = c.Move(v, req.Timeout); err != nil {
-			fault(w, "Action", err.Error())
+			controllerFault(w, req.Token, err)
 			return
 		}
 		writeSOAP(w, http.StatusOK, onvif.PTZEmptyResponse(operation))
 
 	case onvif.PTZStop:
-		token, panTilt, zoom := onvif.ParseStop(b)
+		token, panTilt, zoom, err := onvif.ParseStop(b)
+		if err != nil {
+			fault(w, "InvalidArgVal", err.Error())
+			return
+		}
 		c, ok := camera(token)
 		if !ok {
 			fault(w, "NoProfile", "no PTZ for this profile")
 			return
 		}
-		if err := c.Stop(panTilt, zoom); err != nil {
-			fault(w, "Action", err.Error())
+		if err = c.Stop(panTilt, zoom); err != nil {
+			controllerFault(w, token, err)
 			return
 		}
 		writeSOAP(w, http.StatusOK, onvif.PTZEmptyResponse(operation))
 
 	case onvif.PTZGetPresets:
-		c, ok := camera(onvif.FindTagValue(b, "ProfileToken"))
+		token := onvif.FindTagValue(b, "ProfileToken")
+		c, ok := camera(token)
 		if !ok {
 			fault(w, "NoProfile", "no PTZ for this profile")
 			return
 		}
 		presets, err := c.Presets()
 		if err != nil {
-			fault(w, "Action", err.Error())
+			controllerFault(w, token, err)
 			return
 		}
 		list := make([]onvif.PTZPreset, 0, len(presets))
@@ -274,21 +382,10 @@ func ptzService(w http.ResponseWriter, r *http.Request, operation string, b []by
 			fault(w, "NoToken", "no such preset")
 			return
 		}
-		presets, err := c.Presets()
-		if err != nil {
-			fault(w, "Action", err.Error())
-			return
-		}
-		known := false
-		for _, p := range presets {
-			known = known || p.ID == id
-		}
-		if !known {
-			fault(w, "NoToken", "no such preset")
-			return
-		}
-		if err = c.GotoPreset(id); err != nil {
-			fault(w, "Action", err.Error())
+		// no look at the camera's list first: the request must reach the
+		// controller in the order it came, a Stop right after it replaces it
+		if err := c.GotoPreset(id); err != nil {
+			controllerFault(w, token, err)
 			return
 		}
 		writeSOAP(w, http.StatusOK, onvif.PTZEmptyResponse(operation))
@@ -311,7 +408,7 @@ func ptzService(w http.ResponseWriter, r *http.Request, operation string, b []by
 		}
 		n, err := c.SetPreset(id, name)
 		if err != nil {
-			fault(w, "Action", err.Error())
+			controllerFault(w, token, err)
 			return
 		}
 		writeSOAP(w, http.StatusOK, onvif.PTZSetPresetResponse(strconv.Itoa(int(n))))
