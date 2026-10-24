@@ -183,6 +183,7 @@ A summary table of all modules and features can be found [here](internal/README.
 
 #### private protocols
 
+- [`bc`](internal/bc/README.md) - [Reolink](https://reolink.com/) cameras using the native Baichuan protocol, by IP or by UID over Reolink P2P, with two-way audio.
 - [`bubble`](internal/bubble/README.md) - Some NVR from [dvr163.com](http://help.dvr163.com/) and [eseecloud.com](http://www.eseecloud.com/).
 - [`doorbird`](internal/doorbird/README.md) - [Doorbird](https://www.doorbird.com/) devices with two-way audio.
 - [`dvrip`](internal/dvrip/README.md) - DVR-IP NVR, NetSurveillance, Sofia protocol (XMeye SDK).
@@ -272,6 +273,7 @@ This is a feature when go2rtc expects to receive an incoming stream from an exte
 ### Two-way audio
 
 Supported for:
+[`bc`](internal/bc/README.md), 
 [`doorbird`](internal/doorbird/README.md), 
 [`dvrip`](internal/dvrip/README.md), 
 [`exec`](internal/exec/README.md), 

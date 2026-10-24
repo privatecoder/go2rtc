@@ -16,6 +16,7 @@ Some formats and protocols go2rtc supports exclusively. They have no equivalent 
 | module         | formats         | protocols        | input | output | ingest | two-way |
 |----------------|-----------------|------------------|-------|--------|--------|---------|
 | [`alsa`]       | `pcm`           | `ioctl`          | yes   |        |        |         |
+| [`bc`]         | -               | `tcp`, `udp`     | yes   |        |        | yes     |
 | [`bubble`]     | -               | `http`           | yes   |        |        |         |
 | [`doorbird`]   | `mulaw`         | `http`           | yes   |        |        | yes     |
 | [`dvrip`]      | -               | `tcp`            | yes   |        |        | yes     |
@@ -70,6 +71,7 @@ Some formats and protocols go2rtc supports exclusively. They have no equivalent 
 [`alsa`]: alsa/README.md
 [`api`]: api/README.md
 [`app`]: app/README.md
+[`bc`]: bc/README.md
 [`bubble`]: bubble/README.md
 [`debug`]: debug/README.md
 [`doorbird`]: doorbird/README.md
