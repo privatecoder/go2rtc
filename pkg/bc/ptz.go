@@ -19,6 +19,15 @@ var (
 	maxMove      = 10 * time.Second       // longest a continuous move runs without a Stop
 	controlIdle  = 60 * time.Second       // a control session closes after this long unused
 	zoomInterval = 200 * time.Millisecond // between two steps of a continuous zoom
+
+	// An unacknowledged Stop is sent again after these waits (the last one
+	// repeats) until stopGiveUp has passed since it was wanted.
+	stopBackoff = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second}
+	stopGiveUp  = 60 * time.Second
+
+	stopWait = 3 * time.Second  // Stop returns after this at the latest, the retries go on
+	moveWait = 15 * time.Second // Move waits this long for its own command at the most
+	capsWait = 3 * time.Second  // Move waits this long for the zoom range
 )
 
 const (
@@ -46,15 +55,19 @@ func CameraKey(rawURL string) (string, error) {
 }
 
 // registry of the clients of running producers, by camera. PTZ commands use
-// them instead of logging in again.
+// them instead of logging in again. registryChange is closed and replaced
+// whenever a client is added, which wakes the PTZ calls waiting for a session.
 var (
-	registryMu sync.Mutex
-	registry   = map[string][]*Client{}
+	registryMu     sync.Mutex
+	registry       = map[string][]*Client{}
+	registryChange = make(chan struct{})
 )
 
 func registerClient(key string, c *Client) {
 	registryMu.Lock()
 	registry[key] = append(registry[key], c)
+	close(registryChange)
+	registryChange = make(chan struct{})
 	registryMu.Unlock()
 
 	go func() {
@@ -74,6 +87,12 @@ func registerClient(key string, c *Client) {
 			registry[key] = list
 		}
 	}()
+}
+
+func registryWatch() <-chan struct{} {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	return registryChange
 }
 
 // activeClient is the most recently registered live client of the camera.
@@ -123,8 +142,15 @@ type Velocity struct {
 // PTZ controls one camera. It sends over the client of a running stream of
 // that camera, and only if there is none over a session of its own that closes
 // when idle. It never takes part in streaming.
+//
+// Pan/tilt commands go through one loop. Move, Stop and the safety deadline
+// only change the wanted state under moveMu (no I/O there) and wake the loop,
+// which sends the latest wanted command: a command replaced before it was sent
+// is never sent, so a Stop is never followed by an older Move. A camera that
+// may be moving is stopped until a Stop is acknowledged.
 type PTZ struct {
 	key, rawURL string
+	open        func() (*Client, error) // opens a control session, p.login unless a test replaces it
 
 	capsMu sync.Mutex
 	caps   *PTZCaps
@@ -138,16 +164,39 @@ type PTZ struct {
 
 	presetMu sync.Mutex
 
-	moveMu   sync.Mutex // the move state below
-	panOn    bool
-	stepper  *zoomStepper
-	deadline *time.Timer
-	gen      uint64
+	moveMu     sync.Mutex // the state below
+	desired    *panCmd    // next command for the loop, nil if none
+	kick       chan struct{}
+	looping    bool
+	mayMove    bool      // the camera may be moving: a Move was accepted, no Stop acknowledged since
+	stopWanted bool      // a Stop must be sent until it is acknowledged
+	stopSince  time.Time // when the Stop was first wanted
+	retryAt    time.Time
+	fails      int
+	gen        uint64
+	timer      *time.Timer // the safety deadline
+	stepper    *zoomStepper
 }
 
 func newPTZ(key, rawURL string) *PTZ {
-	return &PTZ{key: key, rawURL: rawURL}
+	p := &PTZ{key: key, rawURL: rawURL, kick: make(chan struct{})}
+	p.open = p.login
+	return p
 }
+
+// panCmd is a pan/tilt command for the loop.
+type panCmd struct {
+	dir   Direction
+	speed float32
+	done  chan error // buffered, the result of the command
+	once  sync.Once
+}
+
+func newPanCmd(dir Direction, speed float32) *panCmd {
+	return &panCmd{dir: dir, speed: speed, done: make(chan error, 1)}
+}
+
+func (c *panCmd) complete(err error) { c.once.Do(func() { c.done <- err }) }
 
 type capsFlight struct {
 	done chan struct{}
@@ -175,7 +224,7 @@ func (p *PTZ) Caps(ctx context.Context) (PTZCaps, error) {
 		p.flight = fl
 		go func() {
 			var caps PTZCaps
-			err := p.do(context.Background(), func(c *Client) (err error) {
+			err := p.do(context.Background(), func(c *Client, _ <-chan struct{}) (err error) {
 				caps, err = c.PTZCaps()
 				return
 			})
@@ -204,15 +253,15 @@ func (p *PTZ) Caps(ctx context.Context) (PTZCaps, error) {
 	return *p.caps, nil
 }
 
-// do runs fn on a client of the camera. A client that died under the call is
-// replaced once.
-func (p *PTZ) do(ctx context.Context, fn func(*Client) error) error {
+// do runs fn on a client of the camera, cancel ends when ctx does. A client
+// that died under the call is replaced once.
+func (p *PTZ) do(ctx context.Context, fn func(c *Client, cancel <-chan struct{}) error) error {
 	for attempt := 0; ; attempt++ {
 		c, control, err := p.acquire(ctx)
 		if err != nil {
 			return err
 		}
-		err = fn(c)
+		err = fn(c, ctx.Done())
 		if err == nil || attempt > 0 {
 			return err
 		}
@@ -227,13 +276,16 @@ func (p *PTZ) do(ctx context.Context, fn func(*Client) error) error {
 	}
 }
 
-// acquire is the client of a running stream or else the control session.
+// acquire is the client of a running stream or else the control session. A
+// stream that starts meanwhile wins, also while a control session is being
+// opened (that one finishes and expires unused).
 func (p *PTZ) acquire(ctx context.Context) (c *Client, control bool, err error) {
-	if c = activeClient(p.key); c != nil {
-		return c, false, nil
-	}
-
 	for {
+		changed := registryWatch() // before the lookup, so a registration is not missed
+		if c = activeClient(p.key); c != nil {
+			return c, false, nil
+		}
+
 		p.mu.Lock()
 		if p.ctrl != nil {
 			select {
@@ -256,18 +308,21 @@ func (p *PTZ) acquire(ctx context.Context) (c *Client, control bool, err error) 
 
 		select {
 		case <-fl.done:
+			if c = activeClient(p.key); c != nil {
+				return c, false, nil
+			}
+			if fl.err != nil {
+				return nil, false, fl.err
+			}
+		case <-changed:
 		case <-ctx.Done():
 			return nil, false, ctx.Err()
 		}
-		if fl.err != nil {
-			return nil, false, fl.err
-		}
-		// loop: the session may have been replaced by a stream client or died
 	}
 }
 
 func (p *PTZ) openControl(fl *dialFlight) {
-	c, err := p.login()
+	c, err := p.open()
 
 	p.mu.Lock()
 	if err == nil {
@@ -341,103 +396,284 @@ func (p *PTZ) dropLocked(c *Client) {
 
 // Move starts a continuous move that ends with Stop, with the timeout or, if
 // that is zero or longer than maxMove, after maxMove. It replaces the move
-// before it.
+// before it. The safety deadline runs from here, whatever the camera or the
+// session do after. It returns the result of its own pan/tilt command, nil if
+// a newer command replaced it before it was sent.
 func (p *PTZ) Move(v Velocity, timeout time.Duration) error {
 	if timeout <= 0 || timeout > maxMove {
 		timeout = maxMove
 	}
 	pan, tilt, zoom := unit(v.Pan), unit(v.Tilt), unit(v.Zoom)
 
-	p.moveMu.Lock()
-	defer p.moveMu.Unlock()
-
-	p.gen++
-	p.cancelTimerLocked()
-	p.stopStepperLocked()
-
-	// before anything is sent, a camera without zoom must not half-do the move
+	// before anything changes, a camera without zoom must not half-do the move
 	var caps PTZCaps
 	wantZoom := v.HasZoom && zoom != 0
 	if wantZoom {
+		ctx, cancel := context.WithTimeout(context.Background(), capsWait)
 		var err error
-		if caps, err = p.Caps(context.Background()); err == nil && !caps.Zoom {
+		caps, err = p.Caps(ctx)
+		cancel()
+		if err == nil && !caps.Zoom {
 			err = errors.New("bc: camera has no zoom")
 		}
 		if err != nil {
-			if p.panOn { // its timer is gone, do not leave it running
-				_ = p.stopPanLocked()
-			}
 			return err
 		}
 	}
 
-	dir, speed := DirStop, float32(0)
-	sendPT := v.HasPanTilt
-	if sendPT {
-		dir, speed = direction(pan, tilt)
-	}
-	// a pan or tilt still running from the move before would lose its timer
-	if sendPT || p.panOn {
-		if err := p.do(context.Background(), func(c *Client) error { return c.PTZMove(dir, speed) }); err != nil {
-			p.panOn = false
-			return err
-		}
-		p.panOn = dir != DirStop
-	}
+	deadline := time.Now().Add(timeout)
 
+	p.moveMu.Lock()
+	p.gen++
+	prev := p.cancelStepperLocked()
+
+	var cmd *panCmd
+	// a pan or tilt still running from the move before would lose its deadline
+	if v.HasPanTilt || p.mayMove {
+		dir, speed := DirStop, float32(0)
+		if v.HasPanTilt {
+			dir, speed = direction(pan, tilt)
+		}
+		cmd = newPanCmd(dir, speed)
+		if dir == DirStop {
+			p.wantStopLocked()
+		} else {
+			p.mayMove, p.stopWanted, p.stopSince = true, false, time.Time{}
+		}
+		p.setDesiredLocked(cmd)
+	}
+	if p.mayMove || wantZoom {
+		p.armLocked(deadline)
+	}
 	if wantZoom {
-		p.stepper = p.startStepper(zoom, caps)
+		p.stepper = p.startStepper(zoom, caps, prev)
 	}
+	p.moveMu.Unlock()
 
-	if p.panOn || p.stepper != nil {
-		gen := p.gen
-		p.deadline = time.AfterFunc(timeout, func() { p.expireMove(gen) })
+	if cmd == nil {
+		return nil
 	}
-	return nil
+	t := time.NewTimer(moveWait)
+	defer t.Stop()
+	select {
+	case err := <-cmd.done:
+		return err
+	case <-t.C:
+		return errors.New("bc: ptz move: no result in time")
+	}
 }
 
-// expireMove is the safety stop.
+// Stop ends the pan/tilt and/or the zoom of the current move. A pan/tilt Stop
+// is sent even if no move is known, it may have been started by someone else.
+// It returns after the first attempt (or stopWait), an unacknowledged Stop is
+// repeated in the background.
+func (p *PTZ) Stop(panTilt, zoom bool) error {
+	p.moveMu.Lock()
+	var s *zoomStepper
+	if zoom {
+		s = p.cancelStepperLocked()
+	}
+	var cmd *panCmd
+	if panTilt {
+		cmd = newPanCmd(DirStop, 0)
+		p.wantStopLocked()
+		p.setDesiredLocked(cmd)
+	} else if !p.mayMove && p.stepper == nil {
+		p.gen++
+		p.cancelTimerLocked()
+	}
+	p.moveMu.Unlock()
+
+	var err error
+	if cmd != nil {
+		t := time.NewTimer(stopWait)
+		select {
+		case err = <-cmd.done:
+		case <-t.C:
+			err = errors.New("bc: ptz stop not acknowledged yet, retrying")
+		}
+		t.Stop()
+	}
+	if s != nil {
+		<-s.done // its requests are cancelled, this is quick
+	}
+	return err
+}
+
+// wantStopLocked starts the obligation to stop the camera.
+func (p *PTZ) wantStopLocked() {
+	p.mayMove = true
+	if !p.stopWanted {
+		p.stopWanted = true
+		p.stopSince = time.Now()
+		p.retryAt = time.Time{}
+		p.fails = 0
+	}
+}
+
+// setDesiredLocked makes cmd the next command, one not yet sent is dropped.
+func (p *PTZ) setDesiredLocked(cmd *panCmd) {
+	if old := p.desired; old != nil {
+		old.complete(nil)
+	}
+	p.desired = cmd
+	close(p.kick) // ends the wait of a command in flight
+	p.kick = make(chan struct{})
+	if !p.looping {
+		p.looping = true
+		go p.run()
+	}
+}
+
+func (p *PTZ) cancelTimerLocked() {
+	if p.timer != nil {
+		p.timer.Stop()
+		p.timer = nil
+	}
+}
+
+func (p *PTZ) armLocked(deadline time.Time) {
+	p.cancelTimerLocked()
+	gen := p.gen
+	p.timer = time.AfterFunc(time.Until(deadline), func() { p.expireMove(gen) })
+}
+
+// expireMove is the safety stop: the wanted state becomes stop.
 func (p *PTZ) expireMove(gen uint64) {
 	p.moveMu.Lock()
 	defer p.moveMu.Unlock()
 	if p.gen != gen {
 		return
 	}
-	p.stopStepperLocked()
-	_ = p.stopPanLocked()
+	p.cancelStepperLocked()
+	if p.mayMove && !p.stopWanted {
+		Log.Filled().Debugf("ptz: no Stop in time, stopping")
+		p.wantStopLocked()
+		p.setDesiredLocked(newPanCmd(DirStop, 0))
+	}
 }
 
-// Stop ends the pan/tilt and/or the zoom of the current move. The camera gets
-// a stop for pan/tilt even if no move is known, the move may have been
-// started by someone else.
-func (p *PTZ) Stop(panTilt, zoom bool) error {
+// run is the command loop, it ends when there is nothing to send or retry.
+func (p *PTZ) run() {
+	for {
+		p.moveMu.Lock()
+		cmd := p.desired
+		p.desired = nil
+		kick := p.kick
+		if cmd == nil {
+			if !p.stopWanted || !p.mayMove {
+				p.looping = false
+				p.moveMu.Unlock()
+				return
+			}
+			if wait := time.Until(p.retryAt); wait > 0 {
+				p.moveMu.Unlock()
+				t := time.NewTimer(wait)
+				select {
+				case <-t.C:
+				case <-kick:
+				}
+				t.Stop()
+				continue
+			}
+			if time.Since(p.stopSince) > stopGiveUp {
+				p.mayMove, p.stopWanted = false, false
+				p.cancelTimerLocked()
+				p.moveMu.Unlock()
+				Log.Filled().Warnf("ptz: giving up stopping the camera, no Stop was acknowledged")
+				continue
+			}
+			cmd = newPanCmd(DirStop, 0) // a retry
+		}
+		p.moveMu.Unlock()
+		p.send(cmd, kick)
+	}
+}
+
+// send sends one command over whatever session there is. kick is closed when
+// a newer command is wanted, which ends the waits for the session and, for a
+// Stop, for the reply.
+func (p *PTZ) send(cmd *panCmd, kick <-chan struct{}) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-kick:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	c, _, err := p.acquire(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			cmd.complete(nil) // replaced
+			return
+		}
+		p.failed(cmd, err)
+		return
+	}
+
 	p.moveMu.Lock()
-	defer p.moveMu.Unlock()
+	replaced := p.desired != nil
+	p.moveMu.Unlock()
+	if replaced {
+		cmd.complete(nil)
+		return
+	}
 
-	var err error
-	if zoom {
-		p.stopStepperLocked()
+	call, err := c.ptzStart(MsgPTZControl, c.ptzMoveBody(cmd.dir, cmd.speed))
+	if err != nil {
+		p.failed(cmd, err)
+		return
 	}
-	if panTilt {
-		err = p.stopPanLocked()
+
+	if cmd.dir != DirStop {
+		// not waited for here: a Stop must not queue behind the reply
+		go func() {
+			_, err := call.wait(nil)
+			if err != nil {
+				Log.Filled().Debugf("ptz: move not acknowledged: %v", err)
+			}
+			cmd.complete(err)
+		}()
+		return
 	}
-	if !p.panOn && p.stepper == nil {
-		p.gen++
-		p.cancelTimerLocked()
+
+	_, err = call.wait(ctx.Done())
+	switch {
+	case errors.Is(err, ErrCanceled):
+		cmd.complete(nil) // replaced, the newer command goes on from here
+	case err != nil:
+		p.failed(cmd, err)
+	default:
+		p.stopped(cmd)
 	}
-	return err
 }
 
-func (p *PTZ) cancelTimerLocked() {
-	if p.deadline != nil {
-		p.deadline.Stop()
-		p.deadline = nil
+func (p *PTZ) failed(cmd *panCmd, err error) {
+	Log.Filled().Debugf("ptz: %s not sent: %v", cmd.dir, err)
+	if cmd.dir == DirStop {
+		p.moveMu.Lock()
+		p.retryAt = time.Now().Add(stopBackoff[min(p.fails, len(stopBackoff)-1)])
+		p.fails++
+		p.moveMu.Unlock()
 	}
+	cmd.complete(err)
 }
 
-func (p *PTZ) stopPanLocked() error {
-	p.panOn = false
-	return p.do(context.Background(), func(c *Client) error { return c.PTZMove(DirStop, 0) })
+// stopped is an acknowledged Stop: the camera is stopped unless a newer
+// command is already wanted.
+func (p *PTZ) stopped(cmd *panCmd) {
+	p.moveMu.Lock()
+	if p.desired == nil {
+		p.mayMove, p.stopWanted, p.stopSince, p.fails = false, false, time.Time{}, 0
+		if p.stepper == nil {
+			p.cancelTimerLocked()
+		}
+	}
+	p.moveMu.Unlock()
+	cmd.complete(nil)
 }
 
 // zoomStepper moves the lens in small steps, as Baichuan has no continuous zoom.
@@ -446,28 +682,38 @@ type zoomStepper struct {
 	done   chan struct{}
 }
 
-func (p *PTZ) startStepper(zoom float64, caps PTZCaps) *zoomStepper {
+// startStepper starts after prev, the stepper it replaces, has ended.
+func (p *PTZ) startStepper(zoom float64, caps PTZCaps, prev *zoomStepper) *zoomStepper {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &zoomStepper{cancel: cancel, done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
+		if prev != nil {
+			<-prev.done
+		}
 		p.stepZoom(ctx, zoom, caps)
 	}()
 	return s
 }
 
-func (p *PTZ) stopStepperLocked() {
-	if s := p.stepper; s != nil {
-		p.stepper = nil
+// cancelStepperLocked cancels the stepper, including its request in flight,
+// without waiting for it.
+func (p *PTZ) cancelStepperLocked() *zoomStepper {
+	s := p.stepper
+	p.stepper = nil
+	if s != nil {
 		s.cancel()
-		<-s.done
 	}
+	return s
 }
 
 func (p *PTZ) stepZoom(ctx context.Context, zoom float64, caps PTZCaps) {
+	if ctx.Err() != nil {
+		return
+	}
 	var zf *PtzZoomFocus
-	err := p.do(ctx, func(c *Client) (err error) {
-		zf, err = c.ZoomFocus()
+	err := p.do(ctx, func(c *Client, cancel <-chan struct{}) (err error) {
+		zf, err = c.zoomFocus(cancel)
 		return
 	})
 	if err != nil {
@@ -490,7 +736,7 @@ func (p *PTZ) stepZoom(ctx context.Context, zoom float64, caps PTZCaps) {
 		if ctx.Err() != nil {
 			return
 		}
-		err := p.do(ctx, func(c *Client) error { return c.ZoomTo(uint32(next)) })
+		err := p.do(ctx, func(c *Client, cancel <-chan struct{}) error { return c.zoomTo(uint32(next), cancel) })
 		if err != nil {
 			return
 		}
@@ -558,7 +804,7 @@ func direction(pan, tilt float64) (Direction, float32) {
 
 // Presets lists the presets stored in the camera.
 func (p *PTZ) Presets() (list []Preset, err error) {
-	err = p.do(context.Background(), func(c *Client) (err error) {
+	err = p.do(context.Background(), func(c *Client, _ <-chan struct{}) (err error) {
 		list, err = c.PTZPresets()
 		return
 	})
@@ -566,7 +812,7 @@ func (p *PTZ) Presets() (list []Preset, err error) {
 }
 
 func (p *PTZ) GotoPreset(id uint8) error {
-	return p.do(context.Background(), func(c *Client) error { return c.PTZGotoPreset(id) })
+	return p.do(context.Background(), func(c *Client, _ <-chan struct{}) error { return c.PTZGotoPreset(id) })
 }
 
 // SetPreset stores the current position, in the lowest free slot if id < 0.
@@ -597,6 +843,6 @@ func (p *PTZ) SetPreset(id int, name string) (uint8, error) {
 		return 0, fmt.Errorf("bc: preset id %d out of range", id)
 	}
 
-	err := p.do(context.Background(), func(c *Client) error { return c.PTZSetPreset(uint8(id), name) })
+	err := p.do(context.Background(), func(c *Client, _ <-chan struct{}) error { return c.PTZSetPreset(uint8(id), name) })
 	return uint8(id), err
 }

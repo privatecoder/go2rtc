@@ -1,10 +1,14 @@
 package bc
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
+	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,14 +19,44 @@ import (
 func ptzFor(t *testing.T, f *fakeCamera) *PTZ {
 	url := fmt.Sprintf("bc://%s:%s@%s?channel=0", fakeUser, fakePass, f.addr())
 	p := newPTZ("test/"+t.Name(), url)
-	t.Cleanup(func() {
-		p.mu.Lock()
-		if p.ctrl != nil {
-			p.dropLocked(p.ctrl)
-		}
-		p.mu.Unlock()
-	})
+	t.Cleanup(func() { endPTZ(p) })
 	return p
+}
+
+// endPTZ ends what a test left running in the controller: the stop retries,
+// the deadline, the stepper and the control session. The command loop is gone
+// when it returns, so it cannot read the variables a later test changes.
+func endPTZ(p *PTZ) {
+	p.moveMu.Lock()
+	p.mayMove, p.stopWanted = false, false
+	p.cancelTimerLocked()
+	s := p.cancelStepperLocked()
+	p.gen++
+	close(p.kick)
+	p.kick = make(chan struct{})
+	p.moveMu.Unlock()
+	if s != nil {
+		<-s.done
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		p.moveMu.Lock()
+		idle := !p.looping
+		p.moveMu.Unlock()
+		if idle {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	p.mu.Lock()
+	if p.idle != nil {
+		p.idle.Stop()
+	}
+	if p.ctrl != nil {
+		p.dropLocked(p.ctrl)
+	}
+	p.mu.Unlock()
 }
 
 func TestPTZVelocityMapping(t *testing.T) {
@@ -302,4 +336,415 @@ func TestCameraKey(t *testing.T) {
 	}
 	_, err := CameraKey("bc://")
 	require.Error(t, err)
+}
+
+// wire is a controller on a client over an in-memory connection to a hand
+// written camera: respond gets every request and returns the reply and how
+// long it is held back, a nil reply is a lost one.
+func wire(t *testing.T, respond func(*Message) (*Message, time.Duration)) (*PTZ, <-chan *Message) {
+	t.Helper()
+	clientConn, camConn := net.Pipe()
+	c := NewClient(clientConn, Config{ReplyTimeout: 300 * time.Millisecond, WriteTimeout: time.Second})
+	p := newPTZ("wire/"+t.Name(), "bc://unused.invalid")
+	p.ctrl = c
+	seen := make(chan *Message, 100)
+	var writes sync.Mutex
+	go func() {
+		codec := NewCodec("")
+		reader := NewReader(camConn, codec)
+		for {
+			m, err := reader.ReadMessage()
+			if err != nil {
+				return
+			}
+			seen <- m
+			r, delay := respond(m)
+			if r == nil {
+				continue
+			}
+			b, err := codec.Encode(r)
+			if err != nil {
+				return
+			}
+			go func() {
+				time.Sleep(delay)
+				writes.Lock()
+				defer writes.Unlock()
+				_, _ = camConn.Write(b)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		endPTZ(p)
+		_ = c.Close()
+		_ = camConn.Close()
+	})
+	return p, seen
+}
+
+func next(t *testing.T, seen <-chan *Message) *Message {
+	t.Helper()
+	select {
+	case m := <-seen:
+		return m
+	case <-time.After(time.Second):
+		t.Fatal("no wire request")
+		return nil
+	}
+}
+
+func isStop(m *Message) bool {
+	return m.MsgID == MsgPTZControl && m.Body.PtzControl.Command == "stop"
+}
+
+func isMove(m *Message) bool {
+	return m.MsgID == MsgPTZControl && m.Body.PtzControl.Command != "stop"
+}
+
+func ok(m *Message) (*Message, time.Duration) { return reply(m, 200), 0 }
+
+// silent drops the replies of the requests that match.
+func silent(match func(*Message) bool, n *atomic.Int32) func(*Message) (*Message, time.Duration) {
+	return func(m *Message) (*Message, time.Duration) {
+		if match(m) && (n == nil || n.Add(-1) >= 0) {
+			return nil, 0
+		}
+		return ok(m)
+	}
+}
+
+func countCounter(n int32) *atomic.Int32 {
+	var c atomic.Int32
+	c.Store(n)
+	return &c
+}
+
+func TestPTZLostMoveACKStillStops(t *testing.T) {
+	p, seen := wire(t, silent(isMove, nil))
+	err := p.Move(Velocity{Pan: 1, HasPanTilt: true}, 60*time.Millisecond)
+	require.Error(t, err)
+	require.Equal(t, "right", next(t, seen).Body.PtzControl.Command)
+	select {
+	case m := <-seen:
+		require.Equal(t, "stop", m.Body.PtzControl.Command)
+	case <-time.After(450 * time.Millisecond):
+		t.Fatal("Move acknowledgement lost: no safety Stop")
+	}
+}
+
+func TestPTZLostReplacementACKStillStops(t *testing.T) {
+	var moves atomic.Int32
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		if isMove(m) && moves.Add(1) == 2 {
+			return nil, 0 // the acknowledgement of the second Move is lost
+		}
+		return ok(m)
+	})
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Minute))
+	require.Equal(t, "right", next(t, seen).Body.PtzControl.Command)
+	require.Error(t, p.Move(Velocity{Pan: -1, HasPanTilt: true}, 60*time.Millisecond))
+	require.Equal(t, "left", next(t, seen).Body.PtzControl.Command)
+	select {
+	case m := <-seen:
+		require.Equal(t, "stop", m.Body.PtzControl.Command)
+	case <-time.After(450 * time.Millisecond):
+		t.Fatal("replacement Move acknowledgement lost: no safety Stop")
+	}
+}
+
+func TestPTZLostStopIsRetried(t *testing.T) {
+	setVar(t, &stopBackoff, []time.Duration{20 * time.Millisecond})
+	p, seen := wire(t, silent(isStop, countCounter(1)))
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, 500*time.Millisecond))
+	require.Equal(t, "right", next(t, seen).Body.PtzControl.Command)
+
+	require.Error(t, p.Stop(true, true))
+	require.True(t, isStop(next(t, seen)))
+	require.True(t, isStop(next(t, seen)), "the unacknowledged Stop was not repeated")
+
+	// acknowledged now: nothing more, not even at the old deadline
+	time.Sleep(600 * time.Millisecond)
+	require.Empty(t, seen)
+	p.moveMu.Lock()
+	defer p.moveMu.Unlock()
+	require.False(t, p.mayMove)
+	require.False(t, p.stopWanted)
+}
+
+func TestPTZLostWatchdogStopIsRetried(t *testing.T) {
+	setVar(t, &stopBackoff, []time.Duration{20 * time.Millisecond})
+	p, seen := wire(t, silent(isStop, countCounter(1)))
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, 50*time.Millisecond))
+	require.Equal(t, "right", next(t, seen).Body.PtzControl.Command)
+	require.True(t, isStop(next(t, seen)))
+	require.True(t, isStop(next(t, seen)), "the watchdog Stop was not repeated")
+}
+
+func TestPTZStopGivesUp(t *testing.T) {
+	setVar(t, &stopBackoff, []time.Duration{10 * time.Millisecond})
+	setVar(t, &stopGiveUp, 150*time.Millisecond)
+	p, seen := wire(t, silent(isStop, nil))
+	require.Error(t, p.Stop(true, true))
+	require.Eventually(t, func() bool {
+		p.moveMu.Lock()
+		defer p.moveMu.Unlock()
+		return !p.mayMove && !p.stopWanted
+	}, 2*time.Second, 10*time.Millisecond)
+	for len(seen) > 0 {
+		<-seen
+	}
+	time.Sleep(100 * time.Millisecond)
+	require.Empty(t, seen, "Stop attempts after giving up")
+}
+
+func TestPTZStopNotBlockedByMoveACK(t *testing.T) {
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		if isMove(m) {
+			return reply(m, 200), 250 * time.Millisecond
+		}
+		return ok(m)
+	})
+	moved := make(chan error, 1)
+	go func() { moved <- p.Move(Velocity{Pan: 1, HasPanTilt: true}, 50*time.Millisecond) }()
+	require.Equal(t, "right", next(t, seen).Body.PtzControl.Command)
+	stopped := make(chan error, 1)
+	go func() { stopped <- p.Stop(true, true) }()
+
+	select {
+	case m := <-seen:
+		require.True(t, isStop(m))
+	case <-time.After(130 * time.Millisecond):
+		t.Fatal("Stop blocked by the delayed Move acknowledgement")
+	}
+	require.NoError(t, <-moved)
+	require.NoError(t, <-stopped)
+}
+
+func TestPTZDeadlineCountsFromAcceptance(t *testing.T) {
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		if isMove(m) {
+			return reply(m, 200), 250 * time.Millisecond
+		}
+		return ok(m)
+	})
+	moved := make(chan error, 1)
+	go func() { moved <- p.Move(Velocity{Pan: 1, HasPanTilt: true}, 50*time.Millisecond) }()
+	require.Equal(t, "right", next(t, seen).Body.PtzControl.Command)
+	select {
+	case m := <-seen:
+		require.True(t, isStop(m))
+	case <-time.After(130 * time.Millisecond):
+		t.Fatal("the deadline was not running while the Move acknowledgement was awaited")
+	}
+	require.NoError(t, <-moved)
+}
+
+func TestPTZStopSupersedesUnsentMove(t *testing.T) {
+	// the loop is busy with a Stop whose reply is slow: the Move wanted next is
+	// replaced by the Stop after it before anything is sent
+	release := make(chan struct{})
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		return ok(m)
+	})
+	p.open = func() (*Client, error) { <-release; return nil, errors.New("closed") }
+	p.moveMu.Lock()
+	c := p.ctrl
+	p.moveMu.Unlock()
+	p.mu.Lock()
+	p.ctrl = nil // no session: the loop waits for one
+	p.mu.Unlock()
+	_ = c
+
+	moved := make(chan error, 1)
+	go func() { moved <- p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Minute) }()
+	require.Eventually(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.dialer != nil
+	}, time.Second, time.Millisecond)
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- p.Stop(true, true) }()
+	require.NoError(t, <-moved) // replaced, never sent
+	close(release)
+	<-stopped
+	for len(seen) > 0 {
+		require.False(t, isMove(<-seen), "a Move was sent after the Stop")
+	}
+}
+
+func TestPTZStopWhileControlSessionOpens(t *testing.T) {
+	f := newMultiFake(t)
+	p := ptzFor(t, f)
+	gate := make(chan struct{})
+	p.open = func() (*Client, error) { <-gate; return p.login() }
+
+	moved := make(chan error, 1)
+	go func() { moved <- p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Minute) }()
+	require.Eventually(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.dialer != nil
+	}, time.Second, time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // the loop waits for the session
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- p.Stop(true, true) }()
+	require.NoError(t, <-moved) // replaced before it was sent
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned before there was a session")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(gate) // the session comes up
+	require.NoError(t, <-stopped)
+	require.Equal(t, []string{"ptz:stop:0"}, f.events())
+	require.Equal(t, 1, f.loginCount())
+}
+
+func TestPTZStopReturnsWhileSessionOpening(t *testing.T) {
+	setVar(t, &stopWait, 50*time.Millisecond)
+	f := newMultiFake(t)
+	p := ptzFor(t, f)
+	gate := make(chan struct{})
+	p.open = func() (*Client, error) { <-gate; return p.login() }
+
+	start := time.Now()
+	require.Error(t, p.Stop(true, true))
+	require.Less(t, time.Since(start), time.Second)
+
+	close(gate) // the obligation goes on
+	require.Eventually(t, func() bool { return len(f.events()) == 1 }, 2*time.Second, 5*time.Millisecond)
+	require.Equal(t, []string{"ptz:stop:0"}, f.events())
+}
+
+func TestPTZAcquireUsesProducerRegisteredDuringControlOpen(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		t.Run(fmt.Sprint("failed=", failed), func(t *testing.T) {
+			p, _ := wire(t, ok)
+			q, _ := wire(t, ok)
+			p.mu.Lock()
+			c := p.ctrl
+			p.ctrl = nil
+			fl := &dialFlight{done: make(chan struct{})}
+			p.dialer = fl
+			p.mu.Unlock()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			result := make(chan *Client, 1)
+			go func() {
+				got, control, err := p.acquire(ctx)
+				if err != nil || control {
+					got = nil
+				}
+				result <- got
+			}()
+			time.Sleep(30 * time.Millisecond)
+			registerClient(p.key, q.ctrl) // the stream is up
+
+			if failed {
+				fl.err = errors.New("simulated discovery error")
+			} else {
+				p.mu.Lock()
+				p.ctrl = c
+				p.mu.Unlock()
+			}
+			p.mu.Lock()
+			p.dialer = nil
+			p.mu.Unlock()
+			close(fl.done)
+			require.Same(t, q.ctrl, <-result)
+		})
+	}
+}
+
+func TestPTZSupportRequestIsHeaderOnly(t *testing.T) {
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		if m.MsgID == MsgGetSupport {
+			n := uint32(1)
+			r.Body = &Body{Support: &Support{Items: []SupportItem{{ChnID: 0, PtzType: &n}}}}
+		}
+		if m.MsgID == MsgGetZoomFocus {
+			r.ResponseCode = 400
+		}
+		return r, 0
+	})
+	_, err := p.Caps(context.Background())
+	require.NoError(t, err)
+	m := next(t, seen)
+	require.EqualValues(t, 199, m.MsgID)
+	require.Nil(t, m.Extension)
+	require.Nil(t, m.Body)
+}
+
+func TestPTZNonzeroChannelWireMessages(t *testing.T) {
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		switch m.MsgID {
+		case MsgGetPTZPreset:
+			r.Body = &Body{PtzPreset: &PtzPreset{ChannelID: 3}}
+		case MsgGetZoomFocus:
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{ChannelID: 3, Zoom: ZoomPos{Max: 33}}}
+		}
+		return r, 0
+	})
+	c := p.ctrl
+	c.cfg.Channel = 3 // before the first request
+	require.NoError(t, c.PTZMove(DirLeftUp, 32))
+	require.NoError(t, c.PTZSetPreset(3, "door & porch"))
+	require.NoError(t, c.PTZGotoPreset(3))
+	_, err := c.PTZPresets()
+	require.NoError(t, err)
+	_, err = c.ZoomFocus()
+	require.NoError(t, err)
+	require.NoError(t, c.ZoomTo(20))
+	for _, id := range []uint32{18, 19, 19, 190, 294, 295} {
+		m := next(t, seen)
+		require.Equal(t, id, m.MsgID)
+		require.EqualValues(t, 0x6414, m.Class)
+		require.EqualValues(t, 3, m.ChannelID)
+		require.NotNil(t, m.Extension)
+		require.EqualValues(t, 3, *m.Extension.ChannelID)
+		switch {
+		case m.Body != nil && m.Body.PtzControl != nil:
+			require.EqualValues(t, 3, m.Body.PtzControl.ChannelID)
+		case m.Body != nil && m.Body.PtzPreset != nil:
+			require.EqualValues(t, 3, m.Body.PtzPreset.ChannelID)
+		case m.Body != nil && m.Body.StartZoomFocus != nil:
+			require.EqualValues(t, 3, m.Body.StartZoomFocus.ChannelID)
+		}
+	}
+}
+
+func TestPTZStopCancelsZoomRequestAndDoesNotWaitForIt(t *testing.T) {
+	// the lens requests are not answered at all: Stop must neither wait for a
+	// reply timeout (2 s in fastConfig) nor for the stepper's request
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		switch m.MsgID {
+		case MsgGetZoomFocus:
+			r := reply(m, 200)
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 33}}}
+			return r, 0
+		case MsgSetZoomFocus:
+			return nil, 0
+		}
+		return ok(m)
+	})
+	p.ctrl.cfg.ReplyTimeout = 5 * time.Second
+	p.capsMu.Lock()
+	p.caps = &PTZCaps{PanTilt: true, Zoom: true, ZoomMax: 33}
+	p.capsMu.Unlock()
+
+	require.NoError(t, p.Move(Velocity{Pan: 1, Zoom: 1, HasPanTilt: true, HasZoom: true}, time.Minute))
+	for { // until the stepper's request is out
+		if m := next(t, seen); m.MsgID == MsgSetZoomFocus {
+			break
+		}
+	}
+	start := time.Now()
+	require.NoError(t, p.Stop(true, true))
+	require.Less(t, time.Since(start), time.Second)
 }

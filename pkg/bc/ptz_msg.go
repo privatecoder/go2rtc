@@ -95,41 +95,73 @@ func (e *codeError) Error() string {
 	return fmt.Sprintf("bc: msg %d: camera answered %d", e.id, e.code)
 }
 
-// ptzRequest sends one request and returns the reply if the camera accepted it.
-func (c *Client) ptzRequest(id uint32, body *Body) (*Message, error) {
+// ptzCall is a request that is sent and whose reply is awaited separately.
+type ptzCall struct {
+	c  *Client
+	sb *sub
+	id uint32
+}
+
+// ptzStart sends a request. The channel Extension is left out for msg 199,
+// which is asked of the device and sent header-only by neolink.
+func (c *Client) ptzStart(id uint32, body *Body) (*ptzCall, error) {
 	sb, err := c.subscribeNew(id)
 	if err != nil {
 		return nil, err
 	}
-	defer sb.close()
 
-	ext := NewExtension()
-	ext.ChannelID = &c.cfg.Channel
-	err = c.send(&Message{MsgID: id, ChannelID: c.cfg.Channel, MsgNum: sb.num, Class: ClassModern24, Extension: ext, Body: body})
-	if err != nil {
+	m := &Message{MsgID: id, ChannelID: c.cfg.Channel, MsgNum: sb.num, Class: ClassModern24, Body: body}
+	if id != MsgGetSupport {
+		m.Extension = NewExtension()
+		m.Extension.ChannelID = &c.cfg.Channel
+	}
+	if err = c.send(m); err != nil {
+		sb.close()
 		return nil, err
 	}
-	r, err := sb.recv(c.cfg.ReplyTimeout)
+	return &ptzCall{c: c, sb: sb, id: id}, nil
+}
+
+// wait is the reply if the camera accepted the request. cancel ends the wait
+// with ErrCanceled, the request may have been executed anyway.
+func (k *ptzCall) wait(cancel <-chan struct{}) (*Message, error) {
+	defer k.sb.close()
+	r, err := k.sb.recvCancel(k.c.cfg.ReplyTimeout, cancel)
 	if err != nil {
-		return nil, fmt.Errorf("bc: msg %d: %w", id, err)
+		if errors.Is(err, ErrCanceled) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("bc: msg %d: %w", k.id, err)
 	}
 	if r.ResponseCode != 200 {
-		return nil, &codeError{id, r.ResponseCode}
+		return nil, &codeError{k.id, r.ResponseCode}
 	}
 	return r, nil
 }
 
+func (c *Client) ptzRequest(id uint32, body *Body, cancel <-chan struct{}) (*Message, error) {
+	k, err := c.ptzStart(id, body)
+	if err != nil {
+		return nil, err
+	}
+	return k.wait(cancel)
+}
+
+func (c *Client) ptzMoveBody(dir Direction, speed float32) *Body {
+	return &Body{PtzControl: &PtzControl{
+		Version: XMLVersion, ChannelID: c.cfg.Channel, Speed: speed, Command: string(dir),
+	}}
+}
+
 // PTZMove starts a move in a direction, speed is 1..64, or stops with DirStop.
 func (c *Client) PTZMove(dir Direction, speed float32) error {
-	_, err := c.ptzRequest(MsgPTZControl, &Body{PtzControl: &PtzControl{
-		Version: XMLVersion, ChannelID: c.cfg.Channel, Speed: speed, Command: string(dir),
-	}})
+	_, err := c.ptzRequest(MsgPTZControl, c.ptzMoveBody(dir, speed), nil)
 	return err
 }
 
 // PTZPresets lists the stored presets.
 func (c *Client) PTZPresets() ([]Preset, error) {
-	r, err := c.ptzRequest(MsgGetPTZPreset, nil)
+	r, err := c.ptzRequest(MsgGetPTZPreset, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +174,7 @@ func (c *Client) PTZPresets() ([]Preset, error) {
 func (c *Client) ptzPreset(p Preset) error {
 	_, err := c.ptzRequest(MsgPTZPreset, &Body{PtzPreset: &PtzPreset{
 		Version: XMLVersion, ChannelID: c.cfg.Channel, PresetList: PresetList{Presets: []Preset{p}},
-	}})
+	}}, nil)
 	return err
 }
 
@@ -157,8 +189,10 @@ func (c *Client) PTZSetPreset(id uint8, name string) error {
 }
 
 // ZoomFocus reads the lens positions and the zoom range.
-func (c *Client) ZoomFocus() (*PtzZoomFocus, error) {
-	r, err := c.ptzRequest(MsgGetZoomFocus, nil)
+func (c *Client) ZoomFocus() (*PtzZoomFocus, error) { return c.zoomFocus(nil) }
+
+func (c *Client) zoomFocus(cancel <-chan struct{}) (*PtzZoomFocus, error) {
+	r, err := c.ptzRequest(MsgGetZoomFocus, nil, cancel)
 	if err != nil {
 		return nil, err
 	}
@@ -170,10 +204,12 @@ func (c *Client) ZoomFocus() (*PtzZoomFocus, error) {
 
 // ZoomTo moves the lens to an absolute position, the caller keeps it within
 // the range from ZoomFocus.
-func (c *Client) ZoomTo(pos uint32) error {
+func (c *Client) ZoomTo(pos uint32) error { return c.zoomTo(pos, nil) }
+
+func (c *Client) zoomTo(pos uint32, cancel <-chan struct{}) error {
 	_, err := c.ptzRequest(MsgSetZoomFocus, &Body{StartZoomFocus: &StartZoomFocus{
 		Version: XMLVersion, ChannelID: c.cfg.Channel, Command: "zoomPos", MovePos: pos,
-	}})
+	}}, cancel)
 	return err
 }
 
@@ -182,7 +218,7 @@ func (c *Client) ZoomTo(pos uint32) error {
 func (c *Client) PTZCaps() (PTZCaps, error) {
 	var caps PTZCaps
 
-	r, err := c.ptzRequest(MsgGetSupport, nil)
+	r, err := c.ptzRequest(MsgGetSupport, nil, nil)
 	if err != nil {
 		return caps, err
 	}
