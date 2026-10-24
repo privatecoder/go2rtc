@@ -101,9 +101,11 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
 	case onvif.DeviceGetCapabilities:
 		// important for Hass: Media section
 		b = onvif.GetCapabilitiesResponse(r.Host, hasBCStreams())
+		warmPTZ()
 
 	case onvif.DeviceGetServices:
 		b = onvif.GetServicesResponse(r.Host, hasBCStreams())
+		warmPTZ()
 
 	case onvif.DeviceGetDeviceInformation:
 		// important for Hass: SerialNumber (unique server ID)

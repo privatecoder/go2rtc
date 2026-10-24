@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/internal/bc"
@@ -97,8 +98,10 @@ func stateOf(source string) *camState {
 	return st
 }
 
-// resetCamStates forgets what is known about the cameras, for tests.
+// resetCamStates forgets what is known about the cameras, for tests. It waits
+// for a running warm-up first, which could fill the new state with old answers.
 func resetCamStates() {
+	warmWG.Wait()
 	camStatesMu.Lock()
 	camStates = map[string]*camState{}
 	camStatesMu.Unlock()
@@ -168,9 +171,34 @@ func (st *camState) capsOf(ctx context.Context, name string, c ptzController) (c
 // within wait. The cameras that did not answer in time, or failed lately, are
 // left out; a slow request goes on and fills the cache.
 func ptzFeatures(names []string, wait time.Duration) map[string]onvif.PTZFeatures {
+	return askCameras(ptzFor, names, wait)
+}
+
+var (
+	warming atomic.Bool // a warm-up sweep is running
+	warmWG  sync.WaitGroup
+)
+
+// warmPTZ asks the cameras in the background when a client starts talking to
+// the server, so the first GetProfiles finds the answers. The response does
+// not wait for it. The per-camera state keeps this from asking twice, and
+// only one sweep runs at a time, so frequent polls add no waiters.
+func warmPTZ() {
+	if !hasBCStreams() || !warming.CompareAndSwap(false, true) {
+		return
+	}
+	forCamera, names, wait := ptzFor, streams.GetAllNames(), profilesWait // read now, not in the goroutine
+	warmWG.Add(1)
+	go func() {
+		defer warmWG.Done()
+		defer warming.Store(false)
+		askCameras(forCamera, names, wait)
+	}()
+}
+
+func askCameras(forCamera func(string) (ptzController, error), names []string, wait time.Duration) map[string]onvif.PTZFeatures {
 	var mu sync.Mutex
 	result := map[string]onvif.PTZFeatures{}
-	forCamera := ptzFor // read now, the goroutines may outlive the call
 
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()

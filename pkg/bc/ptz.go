@@ -518,10 +518,7 @@ func (p *PTZ) Stop(panTilt, zoom bool) error {
 	p.fallback = nil
 	// one motor command channel: the stop that halts a pan halts a native zoom
 	panTilt = panTilt || (zoom && (!p.noNativeZoom || p.nativeMaybe))
-	var s *zoomStepper
-	if zoom {
-		s = p.cancelStepperLocked()
-	}
+	s := p.cancelStepperLocked() // whatever the flags, a Stop ends the lens steps too
 	var cmd *panCmd
 	if panTilt {
 		cmd = newPanCmd(DirStop, 0)

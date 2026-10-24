@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -724,4 +725,112 @@ func TestPTZFailedProfilesDoNotRepeatControlLogin(t *testing.T) {
 		require.Equal(t, 200, code)
 	}
 	require.EqualValues(t, 1, attempts.Load())
+}
+
+// countingCam answers its abilities at once and counts the requests.
+type countingCam struct {
+	*stubPTZ
+	calls atomic.Int32
+}
+
+func (c *countingCam) Caps(context.Context) (bc.PTZCaps, error) {
+	c.calls.Add(1)
+	return c.caps, nil
+}
+
+func TestPTZCapabilitiesCallWarmsTheCameras(t *testing.T) {
+	c := &countingCam{stubPTZ: zoomCam()}
+	setup(t, nil, map[string][]string{"cam": {camURL}, "plain": {"rtsp://192.168.1.60/s"}})
+	ptzFor = func(string) (ptzController, error) { return c, nil }
+
+	_, _, b := call(t, "/onvif/device_service", soap(`<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>`))
+	require.Contains(t, b, "/onvif/ptz_service")
+	require.Eventually(t, func() bool { return c.calls.Load() == 1 }, time.Second, time.Millisecond)
+
+	// cached: neither call asks again
+	call(t, "/onvif/device_service", soap(`<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>`))
+	call(t, "/onvif/device_service", soap(`<tds:GetServices xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>`))
+	time.Sleep(50 * time.Millisecond)
+	require.EqualValues(t, 1, c.calls.Load())
+}
+
+func TestPTZGetServicesWarmsTheCameras(t *testing.T) {
+	c := &countingCam{stubPTZ: zoomCam()}
+	setup(t, nil, map[string][]string{"cam": {camURL}})
+	ptzFor = func(string) (ptzController, error) { return c, nil }
+
+	call(t, "/onvif/device_service", soap(`<tds:GetServices xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>`))
+	require.Eventually(t, func() bool { return c.calls.Load() == 1 }, time.Second, time.Millisecond)
+}
+
+func TestPTZNoBCStreamsAsksNoCamera(t *testing.T) {
+	c := &countingCam{stubPTZ: zoomCam()}
+	setup(t, nil, map[string][]string{"a": {"rtsp://192.168.1.60/s"}})
+	ptzFor = func(string) (ptzController, error) { return c, nil }
+
+	_, _, b := call(t, "/onvif/device_service", soap(`<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>`))
+	require.Equal(t, goldenCapabilities, b)
+	_, _, b = call(t, "/onvif/device_service", soap(`<tds:GetServices xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>`))
+	require.Equal(t, goldenServices, b)
+	time.Sleep(50 * time.Millisecond)
+	require.Zero(t, c.calls.Load())
+}
+
+func TestPTZRepeatedDiscoveryWhileCapabilitiesPendingAddsNoWaiters(t *testing.T) {
+	setVar(t, &profilesWait, 500*time.Millisecond)
+	gate := make(chan struct{})
+	var release sync.Once
+	defer release.Do(func() { close(gate) })
+	var fetches, lookups atomic.Int32
+	base := zoomCam()
+	c := &funcCaps{stubPTZ: base, caps: func() (bc.PTZCaps, error) {
+		fetches.Add(1)
+		<-gate
+		return base.caps, nil
+	}}
+	setup(t, nil, map[string][]string{"cam": {camURL}})
+	ptzFor = func(string) (ptzController, error) {
+		lookups.Add(1)
+		return c, nil
+	}
+
+	before := runtime.NumGoroutine()
+	for i := 0; i < 100; i++ {
+		call(t, "/onvif/device_service", soap(`<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>`))
+	}
+	require.Eventually(t, func() bool { return fetches.Load() == 1 }, time.Second, time.Millisecond)
+	require.EqualValues(t, 1, lookups.Load(), "a warm-up ran while another was waiting")
+	require.LessOrEqual(t, runtime.NumGoroutine()-before, 12)
+
+	release.Do(func() { close(gate) })
+	require.Len(t, ptzFeatures([]string{"cam"}, time.Second), 1)
+	require.EqualValues(t, 1, fetches.Load())
+}
+
+func TestPTZResetWaitsForWarmUp(t *testing.T) {
+	setup(t, nil, map[string][]string{"cam": {camURL}})
+	entered, gate := make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	defer release.Do(func() { close(gate) })
+	ptzFor = func(string) (ptzController, error) {
+		close(entered)
+		<-gate
+		return zoomCam(), nil
+	}
+	call(t, "/onvif/device_service", soap(`<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>`))
+	<-entered
+
+	// the next test's setup: the older warm-up must be over before the state is reset
+	time.AfterFunc(30*time.Millisecond, func() { release.Do(func() { close(gate) }) })
+	resetCamStates()
+	current := &stubPTZ{}
+	ptzFor = func(string) (ptzController, error) { return current, nil }
+
+	st := stateOf(camURL)
+	st.mu.Lock()
+	filled := st.caps != nil
+	st.mu.Unlock()
+	require.False(t, filled, "an earlier warm-up filled the reset cache")
+	_, _, body := call(t, "/onvif/media_service", soap(`<trt:GetProfiles xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>`))
+	require.NotContains(t, body, "PTZConfiguration")
 }

@@ -1542,3 +1542,27 @@ func TestPTZNativeZoomFallbackStepsFollowTheStopOnOtherSession(t *testing.T) {
 	require.NoError(t, p.Stop(true, true))
 	require.False(t, observed, "lens steps ran on another session while the Stop of the pan was still held back")
 }
+
+func TestPTZPanTiltStopEndsZoomStepper(t *testing.T) {
+	setVar(t, &zoomInterval, 5*time.Millisecond)
+	var steps atomic.Int32
+	p, _ := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		switch m.MsgID {
+		case MsgGetZoomFocus:
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 10000}}}
+		case MsgSetZoomFocus:
+			steps.Add(1)
+		}
+		return r, 0
+	})
+	p.caps = &PTZCaps{PanTilt: true, Zoom: true, ZoomMax: 10000}
+	p.noNativeZoom = true
+
+	require.NoError(t, p.Move(Velocity{Zoom: 0.1, HasZoom: true}, time.Minute))
+	require.Eventually(t, func() bool { return steps.Load() > 1 }, time.Second, time.Millisecond)
+	require.NoError(t, p.Stop(true, false)) // what Home Assistant sends
+	after := steps.Load()
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, after, steps.Load(), "lens steps after Stop")
+}

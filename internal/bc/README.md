@@ -162,8 +162,8 @@ The user and password Frigate sends are ignored. Home Assistant's ONVIF integrat
   `sub` stream of the same camera, whichever is up) and do not touch the video. Only when no stream of that camera is running
   go2rtc opens a session of its own for PTZ, with the same URL and discovery, and closes it after a minute without use.
 - **Where PTZ shows up**: the PTZ service is advertised only if at least one `bc://` stream is configured, and a profile gets
-  PTZ only if the camera reports pan/tilt or zoom (the zoom controls only if it has a zoom lens). go2rtc asks the cameras once at start
-  and a client's first `GetProfiles` waits up to 8 seconds for those that have not answered; a camera that is offline has
+  PTZ only if the camera reports pan/tilt or zoom (the zoom controls only if it has a zoom lens). go2rtc asks the cameras when an ONVIF client first
+  asks for `GetCapabilities` or `GetServices` (nothing logs in at start), and a client's first `GetProfiles` waits up to 8 seconds for those that have not answered; a camera that is offline has
   no PTZ in the answers until it is reachable again, it is retried after 30 seconds, then less often (up to 5 minutes), and its
   other profile data is unaffected. A stream with several sources uses its first `bc://` one.
 - **No authentication**: go2rtc's ONVIF server accepts any request, whoever can reach port 1984 can move the cameras. Keep it on a
