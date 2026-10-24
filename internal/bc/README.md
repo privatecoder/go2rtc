@@ -100,3 +100,15 @@ delay returns at once with `waiting for P2P cooldown, retry in Ns` and does not 
 - Log levels: discovery steps are `debug`, the chosen path and the login (with camera type and resolution) are `info`, drops, retries,
   format changes and errors are `warn`; every line starts with the UID or host.
 - Not supported: PTZ, motion events, SD card playback and other camera settings.
+
+## Credits and license
+
+The protocol knowledge behind this source comes from the reverse-engineering work in
+[privatecoder/neolink](https://github.com/privatecoder/neolink), in particular its
+[`docs/`](https://github.com/privatecoder/neolink/tree/master/docs): Baichuan messages and encryption, the BcMedia framing,
+the UDP P2P discovery handshake and reliable transport (including the receive-rate field that lifts the camera's bitrate cap),
+two-way audio, connection modes and A/V timestamping. Packet samples used as test data come from the same repository.
+neolink itself builds on the original project by George Hilliard and its continuation by QuantumEntangledAndy.
+
+Parts of `pkg/bc` are ported from neolink, which is licensed under the GNU AGPL v3; those parts and binaries that include them
+are distributed under the AGPL v3 as well.
