@@ -103,12 +103,15 @@ delay returns at once with `waiting for P2P cooldown, retry in Ns` and does not 
 
 ## Credits and license
 
-The protocol knowledge behind this source comes from the reverse-engineering work in
-[privatecoder/neolink](https://github.com/privatecoder/neolink), in particular its
-[`docs/`](https://github.com/privatecoder/neolink/tree/master/docs): Baichuan messages and encryption, the BcMedia framing,
-the UDP P2P discovery handshake and reliable transport (including the receive-rate field that lifts the camera's bitrate cap),
-two-way audio, connection modes and A/V timestamping. Packet samples used as test data come from the same repository.
-neolink itself builds on the original project by George Hilliard and its continuation by QuantumEntangledAndy.
+Implemented against the protocol documentation in
+[privatecoder/neolink `docs/`](https://github.com/privatecoder/neolink/tree/master/docs), written in that fork from
+disassembly and packet captures of the official Reolink client and from the neolink source. Findings from that fork used here
+include the meaning of the UDP ACK receive-rate field (formerly `maybe_latency`; reporting the real rate lifts the camera's
+throttling), relay/lookup region selection, the A/V timestamping model and the "Balanced" third stream.
 
-Parts of `pkg/bc` are ported from neolink, which is licensed under the GNU AGPL v3; those parts and binaries that include them
-are distributed under the AGPL v3 as well.
+The Baichuan protocol itself (framing, login and encryption, BcMedia, UDP discovery, talk) was reverse-engineered in the
+original neolink by George Hilliard, Andrew King (QuantumEntangledAndy) and contributors. Parts of `pkg/bc` are ported from
+neolink, and its packet samples are used as test data.
+
+neolink is licensed under the GNU AGPL v3; the parts of `pkg/bc` ported from it, and binaries that include them, are
+distributed under the AGPL v3 as well.
