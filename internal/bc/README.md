@@ -34,6 +34,48 @@ URL-encode special characters in the password, for example `@` as `%40`.
 
 A host that is 10 or more capital letters and digits without a port is a UID, anything else is an address.
 
+## Choosing how to connect
+
+| situation                                              | URL                                                        | transport                   |
+|--------------------------------------------------------|------------------------------------------------------------|-----------------------------|
+| camera on the same LAN, fixed IP                       | `bc://user:pass@192.168.1.123`                             | TCP to port 9000            |
+| camera behind a VPN or routed subnet                   | `bc://user:pass@10.8.0.50`                                 | TCP to port 9000            |
+| camera on the same LAN, IP changes (DHCP)              | `bc://user:pass@95270000ABCDEFGH?discovery=local`          | UDP, LAN broadcast by UID   |
+| remote camera, no VPN, NAT that allows a hole punch    | `bc://user:pass@95270000ABCDEFGH?discovery=map`            | UDP, direct P2P             |
+| remote camera, any NAT                                 | `bc://user:pass@95270000ABCDEFGH`                          | UDP, direct P2P or relay    |
+
+**By IP (TCP)** is the simplest and most robust way: use it whenever go2rtc can reach the camera's address, including through a
+VPN. Nothing but the camera's port 9000 is involved.
+
+**By UID (UDP)** finds the camera through Reolink's P2P service, the same way the Reolink app does when you are away from home:
+
+1. `local` - a broadcast with the UID on the LAN (ports 2015 and 2018), or straight to `addr` when it is set. The camera answers
+   from its current IP, so this works with DHCP.
+2. `remote` - the Reolink lookup servers (`p2p*.reolink.com`, UDP 9999) tell where the camera is registered, and go2rtc tries the
+   camera's LAN address as the servers know it.
+3. `map` - hole punch: go2rtc and the camera send to each other's public addresses at the same time, so both NATs let the traffic
+   through. The stream then flows directly between go2rtc and the camera, not through Reolink.
+4. `relay` (default) - if the hole punch does not succeed within 3 seconds, Reolink's relay server forwards the traffic. This works
+   behind any NAT, but every byte goes through Reolink and the bitrate may be lower.
+
+Each level also tries the ones before it, all in parallel, and the first path that answers wins. The log shows the result at `info`:
+
+```
+95270000ABCDEFGH: media path: direct to the camera at 192.168.1.123:...           # local
+95270000ABCDEFGH: media path: direct P2P to the camera's public address 1.2.3.4:...  # hole punch
+95270000ABCDEFGH: media path: routed through the Reolink relay at ... (not direct)    # relay
+```
+
+Use `discovery=map` to never fall back to the relay, and `discovery=local` to keep a LAN camera away from the internet entirely.
+
+**Requirements for UID sources**
+
+- On the camera: UID/P2P access enabled in the network settings, and internet access for `remote`, `map` and `relay`.
+- On the go2rtc host: outgoing UDP to `p2p*.reolink.com` port 9999 and to the addresses they return; nothing has to be forwarded on
+  the router. In Docker, `local` needs host networking (or a macvlan network) for the LAN broadcast to reach the cameras.
+- `region` (for example `Europe (Germany)`, `North America (East US)`, `Asia (Hong Kong)`) only picks which lookup server is asked;
+  by default all are asked and the fastest answer is used.
+
 ## Frigate and Home Assistant
 
 go2rtc restreams the camera, Frigate and Home Assistant read it from go2rtc:
@@ -59,6 +101,31 @@ cameras:
           roles: [record]
 ```
 
+Browsers play only Opus or G.711 over WebRTC, not the camera's AAC. For audio in WebRTC live views (Home Assistant, Frigate's two-way
+talk) add an Opus track; go2rtc runs that ffmpeg only while a viewer needs it, and only the audio is transcoded:
+
+```yaml
+streams:
+  doorbell:
+    - bc://user:pass@192.168.1.123?stream=main
+    - ffmpeg:doorbell#audio=opus
+```
+
+When you watch over a slow link (a VPN or mobile data), make the small stream Frigate's default live stream. A 4K main stream needs
+4-5 Mbit/s; over a slower link it plays a second, then freezes while the next second arrives:
+
+```yaml
+cameras:
+  doorbell:
+    live:
+      streams:
+        Sub: doorbell_sub   # first entry is the default
+        Main: doorbell
+```
+
+To use this go2rtc build in Frigate, save the binary as `/config/go2rtc` (executable, `chmod 755`) and restart Frigate; the log then
+shows `Using go2rtc binary from '/config/go2rtc'`.
+
 Home Assistant (WebRTC camera, Frigate integration or go2rtc's own card) uses the same stream names. Define each stream once in go2rtc and let every
 consumer read it from there, so the camera sees a single connection per stream.
 
@@ -72,22 +139,12 @@ is converted to the ADPCM format the camera asks for and sent in real time.
 - One microphone talks at a time: while one is speaking, others wait; the most recent one to speak after a pause gets the session.
 - Cameras without talk (or with a talk format other than ADPCM) simply have no backchannel.
 
-## Discovery by UID
-
-The levels are cumulative:
-
-- `local` - LAN broadcast with the UID (or straight to `addr`);
-- `remote` - also the camera's LAN address as the Reolink servers know it;
-- `map` - also a hole punch to its public address (direct P2P through NAT);
-- `relay` (default) - the punch gets 3 seconds, then Reolink's relay forwards the traffic.
-
-Needs outgoing UDP to `p2p*.reolink.com` (port 9999) and the addresses they return. The log shows the chosen path
-(`media path: ...`): direct on the LAN, direct to the public address, or through the relay. The transport reports its real receive rate to
-the camera in every acknowledgement, which is what lets the camera send its full bitrate.
+## Reconnects and cooldown
 
 Failed registrations are retried after 1, 2, 4 ... 30 seconds, and that delay carries over to the next connection attempt for the same
 UID: Reolink limits rapid reconnects per camera, so the source does not retry faster than that. A call that would only wait out the
-delay returns at once with `waiting for P2P cooldown, retry in Ns` and does not extend it.
+delay returns at once with `waiting for P2P cooldown, retry in Ns` and does not extend it. The transport reports its real receive rate
+to the camera in every acknowledgement, which is what lets the camera send its full bitrate over UDP.
 
 ## Notes and known limitations
 
@@ -100,6 +157,19 @@ delay returns at once with `waiting for P2P cooldown, retry in Ns` and does not 
 - Log levels: discovery steps are `debug`, the chosen path and the login (with camera type and resolution) are `info`, drops, retries,
   format changes and errors are `warn`; every line starts with the UID or host.
 - Not supported: PTZ, motion events, SD card playback and other camera settings.
+
+## Troubleshooting
+
+- `login failed, check username and password` - wrong credentials, or a camera user that is refused over Baichuan (try `admin`).
+  Several failed logins in a row can lock the account for a while.
+- `dial tcp ...:9000: i/o timeout` - the camera is not reachable on port 9000 (offline, wrong IP, the port disabled, or a firewall).
+- Stuttering playback with a clean log: check the link between go2rtc and the viewer. To measure the camera side, record from go2rtc
+  on its own host and compare the recorded duration with the wall clock (`timeout 30 ffmpeg -i rtsp://127.0.0.1:8554/<stream> -c copy
+  -f mpegts out.ts`); 30 seconds of content means the camera delivers in real time.
+- More detail: `log: { bc: debug }` adds the discovery steps of UID sources (TCP sources log almost nothing more at debug).
+
+The camera's RTSP, RTMP and ONVIF services are not used by this source and can be disabled; port 9000 ("Basisdienste" / basic
+service) must stay on, and HTTP is only needed for the camera's web UI and other integrations.
 
 ## Credits and license
 
