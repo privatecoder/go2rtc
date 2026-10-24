@@ -87,6 +87,7 @@ func TestPTZVelocityMapping(t *testing.T) {
 func TestPTZZoomOnlyDoesNotMovePanTilt(t *testing.T) {
 	f := newFakeCamera(t)
 	p := ptzFor(t, f)
+	p.noNativeZoom = true
 	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Second))
 	require.NoError(t, p.Stop(false, true))
 	for _, e := range f.events() {
@@ -219,6 +220,7 @@ func TestPTZControlSessionReopensAfterDeath(t *testing.T) {
 func TestPTZZoomStepper(t *testing.T) {
 	f := newFakeCamera(t)
 	p := ptzFor(t, f)
+	p.noNativeZoom = true
 
 	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, 2*time.Second))
 	time.Sleep(500 * time.Millisecond)
@@ -249,6 +251,7 @@ func TestPTZZoomStepperStopsAtLimitAndOut(t *testing.T) {
 	f := newFakeCamera(t)
 	f.zoomCur = 30
 	p := ptzFor(t, f)
+	p.noNativeZoom = true
 
 	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, 5*time.Second))
 	require.Eventually(t, func() bool {
@@ -958,6 +961,7 @@ func TestPTZStopGiveUpKeepsZoomDeadline(t *testing.T) {
 	p.capsMu.Lock()
 	p.caps = &PTZCaps{PanTilt: true, Zoom: true, ZoomMax: 10000}
 	p.capsMu.Unlock()
+	p.noNativeZoom = true
 	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Second))
 	require.Error(t, p.Stop(true, false))
 	// a zoom-only move keeps the old pan Stop obligation
@@ -1220,4 +1224,321 @@ func TestPTZGiveUpDoesNotReleaseLiveQueuedMotion(t *testing.T) {
 		cmds = append(cmds, m.Body.PtzControl.Command)
 	}
 	require.Equal(t, "right", cmds[0])
+}
+
+func TestPTZNativeZoom(t *testing.T) {
+	f := newFakeCamera(t)
+	p := ptzFor(t, f)
+
+	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Minute))
+	require.NoError(t, p.Stop(false, true))
+	require.NoError(t, p.Move(Velocity{Zoom: -0.5, HasZoom: true, HasPanTilt: true}, time.Minute)) // pan/tilt of 0 is still zoom only
+	require.NoError(t, p.Stop(false, true))
+	require.Equal(t, []string{"ptz:ZoomInc:64", "ptz:stop:0", "ptz:ZoomDec:32", "ptz:stop:0"}, f.events(), "no msg 295 steps")
+}
+
+func TestPTZNativeZoomSafetyStop(t *testing.T) {
+	f := newFakeCamera(t)
+	p := ptzFor(t, f)
+
+	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, 200*time.Millisecond))
+	require.Eventually(t, func() bool {
+		ev := f.events()
+		return len(ev) == 2 && ev[1] == "ptz:stop:0"
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestPTZZoomStopOfPanTiltStopsNativeZoom(t *testing.T) {
+	f := newFakeCamera(t)
+	p := ptzFor(t, f)
+
+	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Minute))
+	require.NoError(t, p.Stop(true, false)) // accepted: one motor channel
+	require.Equal(t, []string{"ptz:ZoomInc:64", "ptz:stop:0"}, f.events())
+}
+
+func TestPTZCombinedPanZoomStillSteps(t *testing.T) {
+	f := newFakeCamera(t)
+	p := ptzFor(t, f)
+
+	require.NoError(t, p.Move(Velocity{Pan: 1, Zoom: 1, HasPanTilt: true, HasZoom: true}, time.Minute))
+	require.Eventually(t, func() bool { return len(f.events()) >= 2 }, time.Second, 5*time.Millisecond)
+	require.NoError(t, p.Stop(true, true))
+	ev := f.events()
+	require.Equal(t, "ptz:right:64", ev[0])
+	require.True(t, strings.HasPrefix(ev[1], "zoom:"), ev[1])
+	for _, e := range ev {
+		require.NotContains(t, e, "Zoom")
+	}
+}
+
+func TestPTZNativeZoomRefusedFallsBackToSteps(t *testing.T) {
+	setVar(t, &zoomInterval, 5*time.Millisecond)
+	var native, steps atomic.Int32
+	p, _ := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		switch {
+		case m.MsgID == MsgPTZControl && strings.HasPrefix(m.Body.PtzControl.Command, "Zoom"):
+			native.Add(1)
+			r.ResponseCode = 400
+		case m.MsgID == MsgGetZoomFocus:
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 33}}}
+		case m.MsgID == MsgSetZoomFocus:
+			steps.Add(1)
+		}
+		return r, 0
+	})
+	p.capsMu.Lock()
+	p.caps = &PTZCaps{PanTilt: true, Zoom: true, ZoomMax: 33}
+	p.capsMu.Unlock()
+
+	// the refused move itself goes on as steps
+	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Minute))
+	require.Eventually(t, func() bool { return steps.Load() > 0 }, time.Second, 5*time.Millisecond)
+	require.NoError(t, p.Stop(false, true))
+	require.EqualValues(t, 1, native.Load())
+
+	// and later ones do not try again
+	steps.Store(0)
+	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Minute)) // the fake lens is at 0, zooming out would have no step
+	require.Eventually(t, func() bool { return steps.Load() > 0 }, time.Second, 5*time.Millisecond)
+	require.NoError(t, p.Stop(false, true))
+	require.EqualValues(t, 1, native.Load(), "native zoom was tried again after the camera refused it")
+}
+
+func TestPTZNativeZoomRefusedAfterStopDoesNotStep(t *testing.T) {
+	var steps atomic.Int32
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		switch {
+		case m.MsgID == MsgPTZControl && strings.HasPrefix(m.Body.PtzControl.Command, "Zoom"):
+			r.ResponseCode = 400
+			return r, 100 * time.Millisecond // the refusal comes after the Stop
+		case m.MsgID == MsgGetZoomFocus:
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 33}}}
+		case m.MsgID == MsgSetZoomFocus:
+			steps.Add(1)
+		}
+		return r, 0
+	})
+	p.capsMu.Lock()
+	p.caps = &PTZCaps{PanTilt: true, Zoom: true, ZoomMax: 33}
+	p.capsMu.Unlock()
+
+	moved := make(chan error, 1)
+	go func() { moved <- p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Minute) }()
+	require.Equal(t, "ZoomInc", next(t, seen).Body.PtzControl.Command)
+	require.NoError(t, p.Stop(false, true))
+	require.Error(t, <-moved)
+	time.Sleep(100 * time.Millisecond)
+	require.Zero(t, steps.Load(), "stepper started for a move that was stopped")
+	require.True(t, p.noNativeZoom)
+}
+
+func TestPTZNativeZoomRefusedStopsPreviousPan(t *testing.T) {
+	var panMoving, combined atomic.Bool
+	var steps atomic.Int32
+	p, _ := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		switch m.MsgID {
+		case MsgPTZControl:
+			switch m.Body.PtzControl.Command {
+			case "right":
+				panMoving.Store(true)
+			case "stop":
+				panMoving.Store(false)
+			case "ZoomInc":
+				r.ResponseCode = 400 // the pan before keeps running
+			}
+		case MsgGetZoomFocus:
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 33, Cur: 16}}}
+		case MsgSetZoomFocus:
+			steps.Add(1)
+			if panMoving.Load() {
+				combined.Store(true)
+			}
+		}
+		return r, 0
+	})
+	p.caps = &PTZCaps{PanTilt: true, Zoom: true, ZoomMax: 33}
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Second))
+	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Second))
+	require.Eventually(t, func() bool { return steps.Load() > 0 }, time.Second, time.Millisecond)
+	require.NoError(t, p.Stop(false, true))
+	require.False(t, combined.Load(), "lens steps ran while the previous pan still moved")
+}
+
+func TestPTZZoomStopAfterGiveUpStillSends(t *testing.T) {
+	setVar(t, &stopBackoff, []time.Duration{5 * time.Millisecond})
+	setVar(t, &stopGiveUp, 30*time.Millisecond)
+	var recovered, moving atomic.Bool
+	var stops atomic.Int32
+	p, _ := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		switch m.MsgID {
+		case MsgGetZoomFocus:
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 33, Cur: 16}}}
+		case MsgPTZControl:
+			switch m.Body.PtzControl.Command {
+			case "ZoomInc":
+				moving.Store(true)
+			case "stop":
+				stops.Add(1)
+				if recovered.Load() {
+					moving.Store(false)
+				} else {
+					r.ResponseCode = 400
+				}
+			}
+		}
+		return r, 0
+	})
+	p.caps = &PTZCaps{PanTilt: true, Zoom: true, ZoomMax: 33}
+	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Second))
+	require.Error(t, p.Stop(false, true))
+	require.Eventually(t, func() bool {
+		p.moveMu.Lock()
+		defer p.moveMu.Unlock()
+		return !p.looping && !p.mayMove && !p.stopWanted
+	}, time.Second, time.Millisecond)
+	require.True(t, moving.Load())
+	before := stops.Load()
+	recovered.Store(true)
+	require.NoError(t, p.Stop(false, true))
+	require.Eventually(t, func() bool { return !moving.Load() }, 100*time.Millisecond, time.Millisecond, "zoom Stop after give-up was not sent")
+	require.Greater(t, stops.Load(), before)
+}
+
+func TestPTZStaleNativeRefusalKeepsZoomStop(t *testing.T) {
+	var zooming atomic.Bool
+	var stops atomic.Int32
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		switch m.MsgID {
+		case MsgGetZoomFocus:
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 33, Cur: 16}}}
+		case MsgPTZControl:
+			switch m.Body.PtzControl.Command {
+			case "ZoomInc":
+				r.ResponseCode = 400
+				return r, 70 * time.Millisecond
+			case "ZoomDec":
+				zooming.Store(true)
+			case "stop":
+				stops.Add(1)
+				zooming.Store(false)
+			}
+		}
+		return r, 0
+	})
+	p.caps = &PTZCaps{PanTilt: true, Zoom: true, ZoomMax: 33}
+	old := make(chan error, 1)
+	go func() { old <- p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Second) }()
+	require.Equal(t, "ZoomInc", next(t, seen).Body.PtzControl.Command)
+	require.NoError(t, p.Move(Velocity{Zoom: -1, HasZoom: true}, time.Second))
+	require.Equal(t, "ZoomDec", next(t, seen).Body.PtzControl.Command)
+	require.Error(t, <-old) // the stale refusal still disables native zoom for later moves
+	p.moveMu.Lock()
+	disabled := p.noNativeZoom
+	p.moveMu.Unlock()
+	require.True(t, disabled)
+	require.True(t, zooming.Load())
+
+	require.NoError(t, p.Stop(false, true))
+	require.Eventually(t, func() bool { return !zooming.Load() }, 100*time.Millisecond, time.Millisecond, "the newer native zoom was not stopped")
+	require.Greater(t, stops.Load(), int32(0))
+}
+
+// fallbackGateConn holds the first Stop write until gate is closed.
+type fallbackGateConn struct {
+	net.Conn
+	gate    <-chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *fallbackGateConn) Write(b []byte) (int, error) {
+	m, _, err := NewCodec("").Decode(b)
+	if err == nil && isStop(m) {
+		c.once.Do(func() { close(c.entered); <-c.gate })
+	}
+	return c.Conn.Write(b)
+}
+
+func TestPTZNativeZoomFallbackStepsFollowTheStopOnOtherSession(t *testing.T) {
+	gate := make(chan struct{})
+	var release sync.Once
+	defer release.Do(func() { close(gate) })
+	a, b := net.Pipe()
+	gated := &fallbackGateConn{Conn: a, gate: gate, entered: make(chan struct{})}
+	c := NewClient(gated, Config{ReplyTimeout: 300 * time.Millisecond, WriteTimeout: time.Second})
+	p := newPTZ("fallback-session/"+t.Name(), "bc://unused.invalid")
+	p.ctrl = c
+	var pan, overlap atomic.Bool
+	go func() {
+		codec := NewCodec("")
+		reader := NewReader(b, codec)
+		for {
+			m, err := reader.ReadMessage()
+			if err != nil {
+				return
+			}
+			r := reply(m, 200)
+			switch m.MsgID {
+			case MsgGetZoomFocus:
+				r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 33, Cur: 16}}}
+			case MsgPTZControl:
+				switch m.Body.PtzControl.Command {
+				case "right":
+					pan.Store(true)
+				case "ZoomInc":
+					r.ResponseCode = 400
+				case "stop":
+					pan.Store(false)
+				}
+			}
+			raw, err := codec.Encode(r)
+			if err != nil {
+				return
+			}
+			if _, err = b.Write(raw); err != nil {
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		release.Do(func() { close(gate) })
+		endPTZ(p)
+		_ = c.Close()
+		_ = b.Close()
+	})
+	p.caps = &PTZCaps{PanTilt: true, Zoom: true, ZoomMax: 33}
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Second))
+
+	// a stream session of the same camera appears, the stepper would use it
+	q, _ := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		switch m.MsgID {
+		case MsgGetZoomFocus:
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 33, Cur: 16}}}
+		case MsgSetZoomFocus:
+			if pan.Load() {
+				overlap.Store(true)
+			}
+		}
+		return r, 0
+	})
+	registerClient(p.key, q.ctrl)
+	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Second))
+	select {
+	case <-gated.entered:
+	case <-time.After(time.Second):
+		t.Fatal("fallback Stop was not sent")
+	}
+	time.Sleep(50 * time.Millisecond)
+	observed := overlap.Load()
+	release.Do(func() { close(gate) })
+	require.Eventually(t, func() bool { return !pan.Load() }, time.Second, time.Millisecond)
+	require.NoError(t, p.Stop(true, true))
+	require.False(t, observed, "lens steps ran on another session while the Stop of the pan was still held back")
 }

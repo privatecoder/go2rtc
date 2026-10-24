@@ -147,9 +147,10 @@ cameras:
 
 The user and password Frigate sends are ignored. Home Assistant's ONVIF integration pointed at go2rtc gets the same PTZ.
 
-- **Move**: pan/tilt in eight directions, speed from how far the ONVIF velocity goes (1 to 64 on the camera), and zoom. Baichuan has no
-  continuous zoom, so go2rtc moves the lens in steps (every 200 ms, about a twentieth of the range per step at full speed) until
-  Stop or the end of the range.
+- **Move**: pan/tilt in eight directions, speed from how far the ONVIF velocity goes (1 to 64 on the camera), and zoom. Zoom is continuous
+  where the camera supports it (the lens runs at its own speed until Stop or the end of the range). A camera that refuses that gets
+  stepped zoom instead (every 200 ms, about a twentieth of the range per step at full speed), as does a move that pans or tilts and
+  zooms at once.
 - **Stop is not left to chance**: a move without a Stop ends by itself after 10 seconds, or after the ONVIF `Timeout` of the
   request if that is shorter. A Stop the camera does not acknowledge is sent again (for up to a minute).
 - **Presets**: the camera's presets are listed and can be gone to. `SetPreset` saves the current position, in the slot the client names

@@ -18,6 +18,8 @@ const (
 	DirRightUp   Direction = "rightUp"
 	DirRightDown Direction = "rightDown"
 	DirStop      Direction = "stop"
+	DirZoomInc   Direction = "ZoomInc" // continuous zoom, the case matters
+	DirZoomDec   Direction = "ZoomDec"
 )
 
 // PtzControl is a move or stop request (msg 18).

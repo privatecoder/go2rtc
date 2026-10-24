@@ -178,12 +178,24 @@ type PTZ struct {
 	motion     *Client     // where the motion commands went while the camera is not settled
 	timer      *time.Timer // the safety deadline
 	stepper    *zoomStepper
+
+	noNativeZoom bool        // the camera refused ZoomInc/ZoomDec once, zoom is stepped from then on
+	nativeMaybe  bool        // a native zoom may be running: set by Move, cleared by an acknowledged Stop or preset
+	fallback     *stepsAfter // lens steps that wait for the Stop of a refused native zoom
 }
 
 func newPTZ(key, rawURL string) *PTZ {
 	p := &PTZ{key: key, rawURL: rawURL, kick: make(chan struct{})}
 	p.open = p.login
 	return p
+}
+
+// stepsAfter is the stepper of a refused native zoom, started when the Stop
+// that goes first is acknowledged.
+type stepsAfter struct {
+	seq  uint64
+	zoom float64
+	caps PTZCaps
 }
 
 // panCmd is a pan/tilt command for the loop.
@@ -194,6 +206,11 @@ type panCmd struct {
 	isPreset bool // go to preset, not a pan/tilt command
 	preset   uint8
 
+	// of a native zoom, for the stepper that takes over if the camera refuses it
+	seq  uint64
+	zoom float64
+	caps PTZCaps
+
 	done chan error // buffered, the result of the command
 	once sync.Once
 }
@@ -203,6 +220,8 @@ func newPanCmd(dir Direction, speed float32) *panCmd {
 }
 
 func (c *panCmd) isStop() bool { return !c.isPreset && c.dir == DirStop }
+
+func (c *panCmd) isZoom() bool { return !c.isPreset && (c.dir == DirZoomInc || c.dir == DirZoomDec) }
 
 func (c *panCmd) complete(err error) { c.once.Do(func() { c.done <- err }) }
 
@@ -445,14 +464,22 @@ func (p *PTZ) Move(v Velocity, timeout time.Duration) error {
 	p.gen++
 	prev := p.cancelStepperLocked()
 
+	dir, speed := DirStop, float32(0)
+	if v.HasPanTilt {
+		dir, speed = direction(pan, tilt)
+	}
+	// the lens has its own continuous zoom, the steps are for combined moves and old cameras
+	native := wantZoom && dir == DirStop && !p.noNativeZoom
+	if native {
+		dir, speed = zoomDirection(zoom)
+		p.nativeMaybe = true
+	}
+
 	var cmd *panCmd
 	// a pan or tilt still running from the move before would lose its deadline
-	if v.HasPanTilt || p.mayMove {
-		dir, speed := DirStop, float32(0)
-		if v.HasPanTilt {
-			dir, speed = direction(pan, tilt)
-		}
+	if v.HasPanTilt || p.mayMove || native {
 		cmd = newPanCmd(dir, speed)
+		cmd.seq, cmd.zoom, cmd.caps = mySeq, zoom, caps
 		if dir == DirStop {
 			p.wantStopLocked()
 		} else {
@@ -463,7 +490,7 @@ func (p *PTZ) Move(v Velocity, timeout time.Duration) error {
 	if p.mayMove || wantZoom {
 		p.armLocked(deadline)
 	}
-	if wantZoom {
+	if wantZoom && !native {
 		p.stepper = p.startStepper(zoom, caps, prev)
 	}
 	p.moveMu.Unlock()
@@ -488,6 +515,9 @@ func (p *PTZ) Move(v Velocity, timeout time.Duration) error {
 func (p *PTZ) Stop(panTilt, zoom bool) error {
 	p.moveMu.Lock()
 	p.seq++
+	p.fallback = nil
+	// one motor command channel: the stop that halts a pan halts a native zoom
+	panTilt = panTilt || (zoom && (!p.noNativeZoom || p.nativeMaybe))
 	var s *zoomStepper
 	if zoom {
 		s = p.cancelStepperLocked()
@@ -596,6 +626,7 @@ func (p *PTZ) run() {
 				continue
 			}
 			if time.Since(p.stopSince) > stopGiveUp {
+				p.fallback = nil
 				p.mayMove, p.stopWanted = false, false // the session stays pinned: older motion may still be queued on it
 				if p.stepper == nil {                  // a running zoom keeps its deadline
 					p.cancelTimerLocked()
@@ -667,6 +698,10 @@ func (p *PTZ) send(cmd *panCmd, kick <-chan struct{}) {
 			_, err := call.wait(nil)
 			if err != nil {
 				Log.Filled().Debugf("ptz: move not acknowledged: %v", err)
+				var ce *codeError
+				if cmd.isZoom() && errors.As(err, &ce) {
+					err = p.stepInstead(cmd, err)
+				}
 			}
 			cmd.complete(err)
 		}()
@@ -687,6 +722,24 @@ func (p *PTZ) send(cmd *panCmd, kick <-chan struct{}) {
 	default:
 		p.settled(cmd)
 	}
+}
+
+// stepInstead is the fallback of a camera that refuses native zoom: it is
+// remembered, and the move goes on as steps if it is still the wanted one.
+// Otherwise err stays the result.
+func (p *PTZ) stepInstead(cmd *panCmd, err error) error {
+	p.moveMu.Lock()
+	defer p.moveMu.Unlock()
+	p.noNativeZoom = true
+	if p.seq != cmd.seq || p.desired != nil || !p.mayMove || p.stopWanted {
+		return err // replaced, stopped or expired meanwhile
+	}
+	// the command that was refused replaced a move that may still run: stop
+	// it first, the steps follow once that Stop is acknowledged (settled)
+	p.wantStopLocked()
+	p.setDesiredLocked(newPanCmd(DirStop, 0))
+	p.fallback = &stepsAfter{seq: cmd.seq, zoom: cmd.zoom, caps: cmd.caps}
+	return nil
 }
 
 // motionClient is the client the camera's unsettled motion was last commanded
@@ -738,7 +791,13 @@ func (p *PTZ) settled(cmd *panCmd) {
 	p.moveMu.Lock()
 	if p.desired == nil {
 		p.mayMove, p.stopWanted, p.stopSince, p.fails = false, false, time.Time{}, 0
+		p.nativeMaybe = false
 		p.motion = nil
+		fb := p.fallback
+		p.fallback = nil
+		if fb != nil && fb.seq == p.seq && cmd.isStop() {
+			p.stepper = p.startStepper(fb.zoom, fb.caps, nil) // the deadline stays
+		}
 		if p.stepper == nil {
 			p.cancelTimerLocked()
 		}
@@ -747,7 +806,7 @@ func (p *PTZ) settled(cmd *panCmd) {
 	cmd.complete(nil)
 }
 
-// zoomStepper moves the lens in small steps, as Baichuan has no continuous zoom.
+// zoomStepper moves the lens in small steps, for cameras without ZoomInc/ZoomDec.
 type zoomStepper struct {
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -772,6 +831,7 @@ func (p *PTZ) startStepper(zoom float64, caps PTZCaps, prev *zoomStepper) *zoomS
 func (p *PTZ) cancelStepperLocked() *zoomStepper {
 	s := p.stepper
 	p.stepper = nil
+	p.fallback = nil
 	if s != nil {
 		s.cancel()
 	}
@@ -871,6 +931,15 @@ func direction(pan, tilt float64) (Direction, float32) {
 	m := math.Max(math.Abs(pan)*float64(h*h), math.Abs(tilt)*float64(v*v))
 	speed := math.Min(ptzMaxSpeed, math.Max(1, math.Round(m*ptzMaxSpeed)))
 	return dir, float32(speed)
+}
+
+// zoomDirection is the PtzControl command and speed of a zoom velocity.
+func zoomDirection(zoom float64) (Direction, float32) {
+	speed := math.Min(ptzMaxSpeed, math.Max(1, math.Round(math.Abs(zoom)*ptzMaxSpeed)))
+	if zoom < 0 {
+		return DirZoomDec, float32(speed)
+	}
+	return DirZoomInc, float32(speed)
 }
 
 // Presets lists the presets stored in the camera.
