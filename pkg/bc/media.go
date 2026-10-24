@@ -560,9 +560,11 @@ func (v *videoClock) next(us uint32) uint64 {
 	return v.acc
 }
 
-// maxAudioDrift is how far the audio clock may run from the video clock
-// before it is put back on it. Frames the transport gave up on (UDP gap skips)
-// carry no duration, so over a long session audio would drift earlier.
+// maxAudioDrift is how far the audio clock may fall behind the video clock
+// before it is moved up to it. Frames the transport gave up on (UDP gap skips)
+// carry no duration, so over a long session audio would drift earlier. Audio
+// ahead of video is left alone: video may just be paused or bursty, and the
+// audio timeline must never go backwards.
 const maxAudioDrift = 500_000 // µs
 
 // audioClock paces audio by its own content duration. Audio has no camera
@@ -583,8 +585,7 @@ func (a *audioClock) next(rate uint32, samples, videoUS uint64, videoOK bool) (p
 		a.on, a.rate = true, rate
 		a.pos = videoUS * uint64(rate) / 1_000_000
 	case videoOK:
-		audioUS := a.pos * 1_000_000 / uint64(rate)
-		if drift := max(audioUS, videoUS) - min(audioUS, videoUS); drift > maxAudioDrift {
+		if audioUS := a.pos * 1_000_000 / uint64(rate); videoUS > audioUS+maxAudioDrift {
 			a.pos = videoUS * uint64(rate) / 1_000_000
 			reanchored = true
 		}

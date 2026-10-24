@@ -499,7 +499,7 @@ func (p *Producer) handleVideo(m *Media) (bool, error) {
 	if m.Kind == KindIframe {
 		// every parameter set in it must be sane, and must stay what the
 		// consumers were set up with
-		var have int
+		have := map[byte]bool{}
 		for _, n := range nals {
 			if !isParam(n.typ, p.hevc) {
 				continue
@@ -511,9 +511,9 @@ func (p *Producer) handleVideo(m *Media) (bool, error) {
 			if !bytes.Equal(p.params[n.typ], n.data) {
 				return false, fmt.Errorf("%w: parameter set %d changed", ErrFormatChanged, n.typ)
 			}
-			have++
+			have[n.typ] = true
 		}
-		if have < len(paramTypes(p.hevc)) {
+		if len(have) < len(paramTypes(p.hevc)) {
 			avcc = p.selfContained(nals)
 		}
 		p.needKey = false

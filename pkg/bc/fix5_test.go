@@ -317,13 +317,31 @@ func TestAudioClockReanchorsOnDrift(t *testing.T) {
 	pos, _ = a.next(16000, 1024, 3_040_000, true)
 	require.Equal(t, uint64(48000+1024), pos)
 
-	// audio running ahead is corrected as well, and without video nothing is
+	// audio running ahead is never rewound, and without video nothing is moved
 	pos, re = a.next(16000, 1024, 1_000_000, true)
-	require.True(t, re)
-	require.Equal(t, uint64(16000), pos)
+	require.False(t, re)
+	require.Equal(t, uint64(48000+2048), pos)
 	pos, re = a.next(16000, 1024, 99_000_000, false)
 	require.False(t, re)
-	require.Equal(t, uint64(16000+1024), pos)
+	require.Equal(t, uint64(48000+3072), pos)
+}
+
+// a video receive gap with continuous audio must not move audio backwards
+func TestAudioClockMonotonicOverVideoGap(t *testing.T) {
+	var a audioClock
+	var last uint64
+	for i := 0; i < 32; i++ { // ~2 s of audio, the video clock stuck at 0
+		pos, re := a.next(16000, 1024, 0, true)
+		require.False(t, re)
+		if i > 0 {
+			require.Equal(t, last+1024, pos)
+		}
+		last = pos
+	}
+	// video resumes where the audio is: no correction either way
+	pos, re := a.next(16000, 1024, 2_048_000, true)
+	require.False(t, re)
+	require.Equal(t, last+1024, pos)
 }
 
 // --- R5: no talk object or goroutine survives a dead transport
@@ -505,3 +523,28 @@ func TestFinalDrainStartsAfterTheLastWrite(t *testing.T) {
 
 var _ = atomic.Int32{}
 var _ = rtp.Packet{}
+
+// a keyframe with the SPS twice but no PPS still gets the full set
+func TestDuplicateSPSWithoutPPSIsCompleted(t *testing.T) {
+	good := swanFrames(t)[0]
+	sets := nalsOf(t, good, false) // SPS, PPS, slice...
+	f := newFakeCamera(t)
+	f.stream = swan(t)
+	p := newFakeProducer(t, f, fastConfig())
+	var out packets
+	p.video.Input = out.add
+
+	dup := append([][]byte{sets[0], sets[0]}, sets[2:]...)
+	useful, err := p.handle(&Media{Kind: KindIframe, Codec: "H264", Data: annexB(dup...)})
+	require.NoError(t, err)
+	require.True(t, useful)
+	pk := out.all()
+	require.Len(t, pk, 1)
+	nals, ok := splitAVCC(pk[0].Payload, false)
+	require.True(t, ok)
+	var types []byte
+	for _, n := range nals {
+		types = append(types, n.typ)
+	}
+	require.Contains(t, types, byte(8), "PPS added: %v", types)
+}
