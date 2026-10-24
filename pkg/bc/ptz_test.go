@@ -748,3 +748,316 @@ func TestPTZStopCancelsZoomRequestAndDoesNotWaitForIt(t *testing.T) {
 	require.NoError(t, p.Stop(true, true))
 	require.Less(t, time.Since(start), time.Second)
 }
+
+func TestPTZStopDuringCapabilityValidation(t *testing.T) {
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		switch m.MsgID {
+		case MsgGetSupport:
+			n := uint32(1)
+			r.Body = &Body{Support: &Support{Items: []SupportItem{{ChnID: 0, PtzType: &n}}}}
+			return r, 200 * time.Millisecond
+		case MsgGetZoomFocus:
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 33}}}
+		}
+		return r, 0
+	})
+	moved := make(chan error, 1)
+	go func() {
+		moved <- p.Move(Velocity{Pan: 1, Zoom: 1, HasPanTilt: true, HasZoom: true}, time.Second)
+	}()
+	require.EqualValues(t, MsgGetSupport, next(t, seen).MsgID)
+	require.NoError(t, p.Stop(true, true))
+	require.True(t, isStop(next(t, seen)))
+	require.NoError(t, <-moved) // superseded while validating
+	observe := time.NewTimer(100 * time.Millisecond)
+	defer observe.Stop()
+	for {
+		select {
+		case m := <-seen:
+			require.False(t, isMove(m), "the older Move sent pan after the Stop")
+			require.NotEqual(t, uint32(MsgSetZoomFocus), m.MsgID, "the older Move started a zoom after the Stop")
+		case <-observe.C:
+			p.moveMu.Lock()
+			defer p.moveMu.Unlock()
+			require.Nil(t, p.stepper)
+			require.Nil(t, p.timer, "the older Move armed a deadline")
+			return
+		}
+	}
+}
+
+func TestPTZMoveSupersededByNewerMoveWhileValidating(t *testing.T) {
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		if m.MsgID == MsgGetSupport {
+			n := uint32(1)
+			r.Body = &Body{Support: &Support{Items: []SupportItem{{ChnID: 0, PtzType: &n}}}}
+			return r, 150 * time.Millisecond
+		}
+		if m.MsgID == MsgGetZoomFocus {
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 33}}}
+		}
+		return r, 0
+	})
+	old := make(chan error, 1)
+	go func() { old <- p.Move(Velocity{Pan: 1, Zoom: 1, HasPanTilt: true, HasZoom: true}, time.Minute) }()
+	require.EqualValues(t, MsgGetSupport, next(t, seen).MsgID)
+	require.NoError(t, p.Move(Velocity{Pan: -1, HasPanTilt: true}, time.Minute)) // no validation needed
+	require.Equal(t, "left", next(t, seen).Body.PtzControl.Command)
+	require.NoError(t, <-old) // superseded, changes nothing
+
+	time.Sleep(100 * time.Millisecond)
+	for len(seen) > 0 {
+		m := <-seen
+		require.False(t, isMove(m) && m.Body.PtzControl.Command == "right", "the older Move overwrote the newer one")
+	}
+}
+
+// A Move whose validation fails changes nothing: the move before it keeps its deadline.
+func TestPTZFailedValidationKeepsPreviousMove(t *testing.T) {
+	f := newFakeCamera(t)
+	f.noPTZ = true // no zoom
+	p := ptzFor(t, f)
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, 150*time.Millisecond))
+	require.Error(t, p.Move(Velocity{Pan: -1, Zoom: 1, HasPanTilt: true, HasZoom: true}, time.Minute))
+	require.Eventually(t, func() bool {
+		ev := f.events()
+		return len(ev) == 2 && ev[0] == "ptz:right:64" && ev[1] == "ptz:stop:0"
+	}, time.Second, 10*time.Millisecond)
+}
+
+// A late write of an older session must not undo a Stop: all motion commands
+// stay on the session of the first, in order. The Stop waits behind the slow
+// write (its return is bounded), the obligation is not retired meanwhile.
+func TestPTZSwitchSessionsKeepsMotionOnOneSession(t *testing.T) {
+	setVar(t, &stopWait, 100*time.Millisecond)
+	release := make(chan struct{})
+	var once sync.Once
+	open := func() { once.Do(func() { close(release) }) }
+	defer open()
+	a, b := net.Pipe()
+	gated := &lateGateConn{Conn: a, gate: release, entered: make(chan struct{})}
+	c := NewClient(gated, Config{ReplyTimeout: time.Second, WriteTimeout: time.Second})
+	p := newPTZ("late-session/"+t.Name(), "bc://unused.invalid")
+	p.ctrl = c
+	applied := make(chan *Message, 10)
+	go func() {
+		codec := NewCodec("")
+		reader := NewReader(b, codec)
+		for {
+			m, err := reader.ReadMessage()
+			if err != nil {
+				return
+			}
+			applied <- m
+			raw, err := codec.Encode(reply(m, 200))
+			if err != nil {
+				return
+			}
+			if _, err = b.Write(raw); err != nil {
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { open(); endPTZ(p); _ = c.Close(); _ = b.Close() })
+	q, seen := wire(t, ok)
+
+	moved := make(chan error, 1)
+	go func() { moved <- p.Move(Velocity{Pan: 1, HasPanTilt: true}, 5*time.Second) }()
+	select {
+	case <-gated.entered:
+	case <-time.After(time.Second):
+		t.Fatal("no queued Move")
+	}
+	registerClient(p.key, q.ctrl) // a stream of the camera starts meanwhile
+
+	require.Error(t, p.Stop(true, true)) // behind the slow write: bounded, not acknowledged yet
+	p.moveMu.Lock()
+	require.True(t, p.mayMove && p.stopWanted && p.timer != nil, "protection retired before the Stop was acknowledged")
+	p.moveMu.Unlock()
+
+	open()
+	require.True(t, isMove(next(t, applied)))
+	require.True(t, isStop(next(t, applied)), "the Stop must follow the Move on the same session")
+	require.NoError(t, <-moved)
+	require.Eventually(t, func() bool {
+		p.moveMu.Lock()
+		defer p.moveMu.Unlock()
+		return !p.mayMove && !p.stopWanted && p.timer == nil && p.motion == nil
+	}, time.Second, 5*time.Millisecond)
+	require.Empty(t, seen, "a command went over the other session")
+}
+
+type lateGateConn struct {
+	net.Conn
+	gate    <-chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *lateGateConn) Write(b []byte) (int, error) {
+	c.once.Do(func() { close(c.entered); <-c.gate })
+	return c.Conn.Write(b)
+}
+
+func TestPTZMotionSessionDiesFallsBackToAcquire(t *testing.T) {
+	p, seen := wire(t, ok)
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Minute))
+	require.True(t, isMove(next(t, seen)))
+	p.moveMu.Lock()
+	dead := p.motion
+	p.moveMu.Unlock()
+	require.NotNil(t, dead)
+	_ = dead.Close()
+
+	q, seenQ := wire(t, ok)
+	registerClient(p.key, q.ctrl) // the camera is reachable over another client
+	require.NoError(t, p.Stop(true, true))
+	require.True(t, isStop(next(t, seenQ)))
+	p.moveMu.Lock()
+	defer p.moveMu.Unlock()
+	require.Nil(t, p.motion)
+	require.False(t, p.mayMove)
+}
+
+func TestPTZMotionSessionIsKeptWhileUnsettled(t *testing.T) {
+	// a producer registered after the Move does not get the Stop
+	p, seen := wire(t, ok)
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Minute))
+	require.True(t, isMove(next(t, seen)))
+	q, seenQ := wire(t, ok)
+	registerClient(p.key, q.ctrl)
+	require.NoError(t, p.Stop(true, true))
+	require.True(t, isStop(next(t, seen)))
+	require.Empty(t, seenQ)
+
+	// settled: the next move may use the new client
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Minute))
+	require.True(t, isMove(next(t, seenQ)))
+}
+
+func TestPTZStopGiveUpKeepsZoomDeadline(t *testing.T) {
+	setVar(t, &stopBackoff, []time.Duration{5 * time.Millisecond})
+	setVar(t, &stopGiveUp, 50*time.Millisecond)
+	setVar(t, &zoomInterval, 5*time.Millisecond)
+	var zooms atomic.Int32
+	p, _ := wire(t, func(m *Message) (*Message, time.Duration) {
+		r := reply(m, 200)
+		if isStop(m) {
+			r.ResponseCode = 400
+		}
+		if m.MsgID == MsgGetZoomFocus {
+			r.Body = &Body{PtzZoomFocus: &PtzZoomFocus{Zoom: ZoomPos{Max: 10000}}}
+		}
+		if m.MsgID == MsgSetZoomFocus {
+			zooms.Add(1)
+		}
+		return r, 0
+	})
+	p.capsMu.Lock()
+	p.caps = &PTZCaps{PanTilt: true, Zoom: true, ZoomMax: 10000}
+	p.capsMu.Unlock()
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Second))
+	require.Error(t, p.Stop(true, false))
+	// a zoom-only move keeps the old pan Stop obligation
+	_ = p.Move(Velocity{Zoom: 0.01, HasZoom: true}, 100*time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
+	before := zooms.Load()
+	time.Sleep(30 * time.Millisecond)
+	require.Equal(t, before, zooms.Load(), "zoom still running after its deadline")
+}
+
+func TestPTZStopRetryDoesNotInterruptGotoPreset(t *testing.T) {
+	setVar(t, &stopBackoff, []time.Duration{100 * time.Millisecond})
+	var stops atomic.Int32
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		if isStop(m) && stops.Add(1) == 1 {
+			return reply(m, 400), 0
+		}
+		return ok(m)
+	})
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Second))
+	require.True(t, isMove(next(t, seen)))
+	require.Error(t, p.Stop(true, true))
+	require.True(t, isStop(next(t, seen)))
+
+	require.NoError(t, p.GotoPreset(3))
+	require.EqualValues(t, MsgPTZPreset, next(t, seen).MsgID)
+	select {
+	case m := <-seen:
+		t.Fatalf("a request followed the acknowledged preset: %d", m.MsgID)
+	case <-time.After(300 * time.Millisecond):
+	}
+	p.moveMu.Lock()
+	defer p.moveMu.Unlock()
+	require.False(t, p.mayMove || p.stopWanted || p.timer != nil || p.motion != nil)
+}
+
+func TestPTZFailedGotoPresetKeepsStopRetries(t *testing.T) {
+	setVar(t, &stopBackoff, []time.Duration{30 * time.Millisecond})
+	var stops atomic.Int32
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		switch {
+		case isStop(m) && stops.Add(1) <= 2:
+			return reply(m, 400), 0 // the first two Stops fail
+		case m.MsgID == MsgPTZPreset:
+			return reply(m, 400), 0
+		}
+		return ok(m)
+	})
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Second))
+	require.True(t, isMove(next(t, seen)))
+	require.Error(t, p.Stop(true, true))
+	require.True(t, isStop(next(t, seen)))
+
+	err := p.GotoPreset(9)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "400")
+
+	// the Stop retries go on until one is acknowledged
+	deadline := time.After(2 * time.Second)
+	for stops.Load() < 3 {
+		select {
+		case <-seen:
+		case <-deadline:
+			t.Fatal("no further Stop after the failed preset")
+		}
+	}
+	require.Eventually(t, func() bool {
+		p.moveMu.Lock()
+		defer p.moveMu.Unlock()
+		return !p.mayMove && !p.stopWanted
+	}, time.Second, 5*time.Millisecond)
+}
+
+func TestPTZFailedGotoPresetStopsRunningMove(t *testing.T) {
+	// the preset replaced a running move and its deadline: the camera is stopped instead
+	p, seen := wire(t, func(m *Message) (*Message, time.Duration) {
+		if m.MsgID == MsgPTZPreset {
+			return reply(m, 400), 0
+		}
+		return ok(m)
+	})
+	require.NoError(t, p.Move(Velocity{Pan: 1, HasPanTilt: true}, time.Minute))
+	require.True(t, isMove(next(t, seen)))
+	require.Error(t, p.GotoPreset(9))
+	require.EqualValues(t, MsgPTZPreset, next(t, seen).MsgID)
+	require.True(t, isStop(next(t, seen)))
+}
+
+func TestPTZGotoPresetStopsZoomAndReplacesUnsentCommand(t *testing.T) {
+	f := newFakeCamera(t)
+	f.presets = []Preset{{ID: 5, Name: "x"}}
+	p := ptzFor(t, f)
+	require.NoError(t, p.Move(Velocity{Zoom: 1, HasZoom: true}, time.Minute))
+	require.Eventually(t, func() bool { return len(f.events()) > 0 }, time.Second, 5*time.Millisecond)
+	require.NoError(t, p.GotoPreset(5))
+	time.Sleep(50 * time.Millisecond)
+	n := len(f.events())
+	require.Equal(t, "preset:toPos:5", f.events()[n-1])
+	time.Sleep(400 * time.Millisecond)
+	require.Len(t, f.events(), n, "the zoom went on after the preset")
+
+	require.Error(t, p.GotoPreset(77)) // unknown to the camera
+}

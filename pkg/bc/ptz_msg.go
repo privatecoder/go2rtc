@@ -171,10 +171,14 @@ func (c *Client) PTZPresets() ([]Preset, error) {
 	return r.Body.PtzPreset.PresetList.Presets, nil
 }
 
-func (c *Client) ptzPreset(p Preset) error {
-	_, err := c.ptzRequest(MsgPTZPreset, &Body{PtzPreset: &PtzPreset{
+func (c *Client) presetBody(p Preset) *Body {
+	return &Body{PtzPreset: &PtzPreset{
 		Version: XMLVersion, ChannelID: c.cfg.Channel, PresetList: PresetList{Presets: []Preset{p}},
-	}}, nil)
+	}}
+}
+
+func (c *Client) ptzPreset(p Preset) error {
+	_, err := c.ptzRequest(MsgPTZPreset, c.presetBody(p), nil)
 	return err
 }
 

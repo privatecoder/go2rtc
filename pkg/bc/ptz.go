@@ -173,7 +173,9 @@ type PTZ struct {
 	stopSince  time.Time // when the Stop was first wanted
 	retryAt    time.Time
 	fails      int
-	gen        uint64
+	gen        uint64      // the move the deadline belongs to
+	seq        uint64      // order of Move, Stop and GotoPreset calls, taken before a Move validates
+	motion     *Client     // where the motion commands went while the camera is not settled
 	timer      *time.Timer // the safety deadline
 	stepper    *zoomStepper
 }
@@ -188,13 +190,19 @@ func newPTZ(key, rawURL string) *PTZ {
 type panCmd struct {
 	dir   Direction
 	speed float32
-	done  chan error // buffered, the result of the command
-	once  sync.Once
+
+	isPreset bool // go to preset, not a pan/tilt command
+	preset   uint8
+
+	done chan error // buffered, the result of the command
+	once sync.Once
 }
 
 func newPanCmd(dir Direction, speed float32) *panCmd {
 	return &panCmd{dir: dir, speed: speed, done: make(chan error, 1)}
 }
+
+func (c *panCmd) isStop() bool { return !c.isPreset && c.dir == DirStop }
 
 func (c *panCmd) complete(err error) { c.once.Do(func() { c.done <- err }) }
 
@@ -405,6 +413,12 @@ func (p *PTZ) Move(v Velocity, timeout time.Duration) error {
 	}
 	pan, tilt, zoom := unit(v.Pan), unit(v.Tilt), unit(v.Zoom)
 
+	// the order of the calls is the order they were made, whatever validation takes
+	p.moveMu.Lock()
+	p.seq++
+	mySeq := p.seq
+	p.moveMu.Unlock()
+
 	// before anything changes, a camera without zoom must not half-do the move
 	var caps PTZCaps
 	wantZoom := v.HasZoom && zoom != 0
@@ -424,6 +438,10 @@ func (p *PTZ) Move(v Velocity, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
 	p.moveMu.Lock()
+	if p.seq != mySeq {
+		p.moveMu.Unlock() // a Stop or a newer call came in meanwhile
+		return nil
+	}
 	p.gen++
 	prev := p.cancelStepperLocked()
 
@@ -469,6 +487,7 @@ func (p *PTZ) Move(v Velocity, timeout time.Duration) error {
 // repeated in the background.
 func (p *PTZ) Stop(panTilt, zoom bool) error {
 	p.moveMu.Lock()
+	p.seq++
 	var s *zoomStepper
 	if zoom {
 		s = p.cancelStepperLocked()
@@ -577,8 +596,10 @@ func (p *PTZ) run() {
 				continue
 			}
 			if time.Since(p.stopSince) > stopGiveUp {
-				p.mayMove, p.stopWanted = false, false
-				p.cancelTimerLocked()
+				p.mayMove, p.stopWanted, p.motion = false, false, nil
+				if p.stepper == nil { // a running zoom keeps its deadline
+					p.cancelTimerLocked()
+				}
 				p.moveMu.Unlock()
 				Log.Filled().Warnf("ptz: giving up stopping the camera, no Stop was acknowledged")
 				continue
@@ -604,7 +625,7 @@ func (p *PTZ) send(cmd *panCmd, kick <-chan struct{}) {
 		}
 	}()
 
-	c, _, err := p.acquire(ctx)
+	c, err := p.motionClient(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			cmd.complete(nil) // replaced
@@ -622,13 +643,25 @@ func (p *PTZ) send(cmd *panCmd, kick <-chan struct{}) {
 		return
 	}
 
-	call, err := c.ptzStart(MsgPTZControl, c.ptzMoveBody(cmd.dir, cmd.speed))
+	var body *Body
+	var id uint32
+	if cmd.isPreset {
+		id, body = MsgPTZPreset, c.presetBody(Preset{ID: cmd.preset, Command: "toPos"})
+	} else {
+		id, body = MsgPTZControl, c.ptzMoveBody(cmd.dir, cmd.speed)
+	}
+	call, err := c.ptzStart(id, body)
 	if err != nil {
 		p.failed(cmd, err)
 		return
 	}
+	// until settled every motion command goes over this client: another
+	// session's writer could deliver an older command after a newer one
+	p.moveMu.Lock()
+	p.motion = c
+	p.moveMu.Unlock()
 
-	if cmd.dir != DirStop {
+	if !cmd.isPreset && cmd.dir != DirStop {
 		// not waited for here: a Stop must not queue behind the reply
 		go func() {
 			_, err := call.wait(nil)
@@ -647,27 +680,60 @@ func (p *PTZ) send(cmd *panCmd, kick <-chan struct{}) {
 	case err != nil:
 		p.failed(cmd, err)
 	default:
-		p.stopped(cmd)
+		p.settled(cmd)
 	}
+}
+
+// motionClient is the client the camera's unsettled motion was last commanded
+// on if it is alive, else whatever session there is.
+func (p *PTZ) motionClient(ctx context.Context) (*Client, error) {
+	p.moveMu.Lock()
+	m := p.motion
+	p.moveMu.Unlock()
+	if m != nil {
+		select {
+		case <-m.Done():
+			p.moveMu.Lock()
+			if p.motion == m {
+				p.motion = nil
+			}
+			p.moveMu.Unlock()
+		default:
+			p.mu.Lock()
+			if p.ctrl == m {
+				p.touchLocked() // in use, not idle
+			}
+			p.mu.Unlock()
+			return m, nil
+		}
+	}
+	c, _, err := p.acquire(ctx)
+	return c, err
 }
 
 func (p *PTZ) failed(cmd *panCmd, err error) {
-	Log.Filled().Debugf("ptz: %s not sent: %v", cmd.dir, err)
-	if cmd.dir == DirStop {
-		p.moveMu.Lock()
+	Log.Filled().Debugf("ptz: command not sent: %v", err)
+	p.moveMu.Lock()
+	switch {
+	case cmd.isStop():
 		p.retryAt = time.Now().Add(stopBackoff[min(p.fails, len(stopBackoff)-1)])
 		p.fails++
-		p.moveMu.Unlock()
+	case cmd.isPreset && p.mayMove && !p.stopWanted && p.desired == nil:
+		// the preset did not happen and the move it replaced lost its deadline
+		p.wantStopLocked()
+		p.setDesiredLocked(newPanCmd(DirStop, 0))
 	}
+	p.moveMu.Unlock()
 	cmd.complete(err)
 }
 
-// stopped is an acknowledged Stop: the camera is stopped unless a newer
-// command is already wanted.
-func (p *PTZ) stopped(cmd *panCmd) {
+// settled is an acknowledged Stop or GotoPreset (a preset move is finite): the
+// camera is settled unless a newer command is already wanted.
+func (p *PTZ) settled(cmd *panCmd) {
 	p.moveMu.Lock()
 	if p.desired == nil {
 		p.mayMove, p.stopWanted, p.stopSince, p.fails = false, false, time.Time{}, 0
+		p.motion = nil
 		if p.stepper == nil {
 			p.cancelTimerLocked()
 		}
@@ -811,8 +877,29 @@ func (p *PTZ) Presets() (list []Preset, err error) {
 	return
 }
 
+// GotoPreset moves the camera to a stored preset. It is a command of the
+// loop like Move and Stop: it replaces a command not yet sent and the zoom, and
+// once it is acknowledged no Stop owed for the move before it is sent. If it
+// fails that Stop is still owed.
 func (p *PTZ) GotoPreset(id uint8) error {
-	return p.do(context.Background(), func(c *Client, _ <-chan struct{}) error { return c.PTZGotoPreset(id) })
+	cmd := newPanCmd(DirStop, 0)
+	cmd.isPreset, cmd.preset = true, id
+
+	p.moveMu.Lock()
+	p.seq++
+	p.gen++
+	p.cancelStepperLocked()
+	p.setDesiredLocked(cmd)
+	p.moveMu.Unlock()
+
+	t := time.NewTimer(moveWait)
+	defer t.Stop()
+	select {
+	case err := <-cmd.done:
+		return err
+	case <-t.C:
+		return errors.New("bc: ptz preset: no result in time")
+	}
 }
 
 // SetPreset stores the current position, in the lowest free slot if id < 0.
