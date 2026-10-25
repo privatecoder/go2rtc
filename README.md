@@ -36,10 +36,6 @@ Ultimate camera streaming application with support for dozens formats and protoc
 
 - [Installation](#installation)
   - [go2rtc: Binary](#go2rtc-binary)
-  - [go2rtc: Docker](#go2rtc-docker)
-  - [go2rtc: Home Assistant add-on](#go2rtc-home-assistant-add-on)
-  - [go2rtc: Home Assistant Integration](#go2rtc-home-assistant-integration)
-  - [go2rtc: Master version](#go2rtc-master-version)
 - [Configuration](#configuration)
 - [Features](#features)
   - [Streaming input](#streaming-input)
@@ -64,7 +60,7 @@ Ultimate camera streaming application with support for dozens formats and protoc
 
 ## Installation
 
-1. Download [binary](#go2rtc-binary) or use [Docker](#go2rtc-docker) or Home Assistant [add-on](#go2rtc-home-assistant-add-on) or [integration](#go2rtc-home-assistant-integration)
+1. Download the [binary](#go2rtc-binary)
 2. Open web interface: `http://localhost:1984/`
 3. Add [streams](#streaming-input) to [config](#configuration)
 
@@ -93,34 +89,6 @@ Don't forget to fix the rights `chmod +x go2rtc_xxx_xxx` on Linux and Mac.
 Frigate.
 
 PS. The application is compiled with the latest versions of the Go language for maximum speed and security. Therefore, the [minimum OS versions](https://go.dev/wiki/MinimumRequirements) depend on the Go language.
-
-### go2rtc: Docker
-
-The Docker containers [`alexxit/go2rtc`](https://hub.docker.com/r/alexxit/go2rtc) and [`ghcr.io/alexxit/go2rtc`](https://github.com/AlexxIT/go2rtc/pkgs/container/go2rtc) support multiple architectures including `386`, `amd64`, `arm/v6`, `arm/v7` and `arm64`.
-These containers offer the same functionality as the Home Assistant [add-on](#go2rtc-home-assistant-add-on) but are designed to operate independently of Home Assistant.
-It comes preinstalled with [FFmpeg](internal/ffmpeg/README.md) and [Python](internal/echo/README.md).
-
-### go2rtc: Home Assistant add-on
-
-[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FAlexxIT%2Fhassio-addons)
-
-1. Settings > Add-ons > Plus > Repositories > Add
-   ```
-   https://github.com/AlexxIT/hassio-addons
-   ```
-2. go2rtc > Install > Start
-
-### go2rtc: Home Assistant Integration
-
-[WebRTC Camera](https://github.com/AlexxIT/WebRTC) custom component can be used on any Home Assistant [installation](https://www.home-assistant.io/installation/), including [HassWP](https://github.com/AlexxIT/HassWP) on Windows. It can automatically download and use the latest version of go2rtc. Or it can connect to an existing version of go2rtc. Addon installation in this case is optional.
-
-### go2rtc: Master version
-
-Latest, but maybe unstable version:
-
-- Binary: [latest master build](https://nightly.link/AlexxIT/go2rtc/workflows/build/master)
-- Docker: `alexxit/go2rtc:master` or `alexxit/go2rtc:master-hardware` versions
-- Home Assistant add-on: `go2rtc master` or `go2rtc master hardware` versions
 
 ## Configuration
 
@@ -470,7 +438,7 @@ webrtc:
 ```
 
 - local access to RTSP is not a problem for [FFmpeg](internal/ffmpeg/README.md) integration, because it runs locally on your server
-- local access to API is not a problem for the [Home Assistant add-on](#go2rtc-home-assistant-add-on), because Home Assistant runs locally on the same server, and the add-on web UI is protected with Home Assistant authorization ([Ingress feature](https://www.home-assistant.io/blog/2019/04/15/hassio-ingress/))
+- local access to API is not a problem for the Home Assistant add-on, because Home Assistant runs locally on the same server, and the add-on web UI is protected with Home Assistant authorization ([Ingress feature](https://www.home-assistant.io/blog/2019/04/15/hassio-ingress/))
 - external access to WebRTC TCP port is not a problem, because it is used only for transmitting encrypted media data
     - anyway you need to open this port to your local network and to the Internet for WebRTC to work
 
