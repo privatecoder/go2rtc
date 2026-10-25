@@ -88,25 +88,25 @@ Ultimate camera streaming application with support for dozens formats and protoc
 
 ### go2rtc: Binary
 
-Download binary for your OS from [latest release](https://github.com/AlexxIT/go2rtc/releases/):
+This is a fork of [AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc) that adds a native Reolink Baichuan source (`bc://`)
+with PTZ through go2rtc's ONVIF server. Its releases are separate from upstream's.
 
-| name                                                                                                            | description                                                                                                                               |
-|-----------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
-| [go2rtc_win64.zip](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_win64.zip)                 | Windows 10+ 64-bit                                                                                                                        |
-| [go2rtc_win32.zip](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_win32.zip)                 | Windows 10+ 32-bit                                                                                                                        |
-| [go2rtc_win_arm64.zip](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_win_arm64.zip)         | Windows ARM 64-bit                                                                                                                        |
-| [go2rtc_linux_amd64](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_amd64)             | Linux 64-bit                                                                                                                              |
-| [go2rtc_linux_i386](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_i386)               | Linux 32-bit                                                                                                                              |
-| [go2rtc_linux_arm64](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_arm64)             | Linux ARM 64-bit (ex. Raspberry 64-bit OS)                                                                                                |
-| [go2rtc_linux_arm](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_arm)                 | Linux ARM 32-bit (ex. Raspberry 32-bit OS)                                                                                                |
-| [go2rtc_linux_armv6](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_armv6)             | Linux ARMv6 (for old Raspberry 1 and Zero)                                                                                                |
-| [go2rtc_linux_mipsel](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_mipsel)           | Linux MIPS (ex. [Xiaomi Gateway 3](https://github.com/AlexxIT/XiaomiGateway3), [Wyze cameras](https://github.com/gtxaspec/wz_mini_hacks)) |
-| [go2rtc_mac_amd64.zip](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_mac_amd64.zip)         | macOS 11+ Intel 64-bit                                                                                                                    |
-| [go2rtc_mac_arm64.zip](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_mac_arm64.zip)         | macOS ARM 64-bit                                                                                                                          |
-| [go2rtc_freebsd_amd64.zip](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_freebsd_amd64.zip) | FreeBSD 64-bit                                                                                                                            |
-| [go2rtc_freebsd_arm64.zip](https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_freebsd_arm64.zip) | FreeBSD ARM 64-bit                                                                                                                        |
+Download the binary for your OS from the [latest release](https://github.com/privatecoder/go2rtc/releases/latest) of this fork:
+
+| name                                                                                                          | description                                |
+|---------------------------------------------------------------------------------------------------------------|--------------------------------------------|
+| [go2rtc_linux_amd64](https://github.com/privatecoder/go2rtc/releases/latest/download/go2rtc_linux_amd64)     | Linux 64-bit                               |
+| [go2rtc_linux_arm64](https://github.com/privatecoder/go2rtc/releases/latest/download/go2rtc_linux_arm64)     | Linux ARM 64-bit (ex. Raspberry 64-bit OS) |
+| [go2rtc_mac_arm64.zip](https://github.com/privatecoder/go2rtc/releases/latest/download/go2rtc_mac_arm64.zip) | macOS ARM 64-bit                           |
+
+The binaries are built by GitHub Actions from each release tag. `SHA256SUMS.txt` in the release lists their checksums. For
+other platforms, use [upstream go2rtc](https://github.com/AlexxIT/go2rtc/releases/) (without the Baichuan source) or build
+from source.
 
 Don't forget to fix the rights `chmod +x go2rtc_xxx_xxx` on Linux and Mac.
+
+**Frigate**: save `go2rtc_linux_amd64` (or `_arm64`) as `/config/go2rtc`, make it executable (`chmod 755`) and restart
+Frigate.
 
 PS. The application is compiled with the latest versions of the Go language for maximum speed and security. Therefore, the [minimum OS versions](https://go.dev/wiki/MinimumRequirements) depend on the Go language.
 
