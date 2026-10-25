@@ -143,9 +143,13 @@ cameras:
       host: 127.0.0.1         # go2rtc, here inside the Frigate container
       port: 1984              # go2rtc's API port
       profile: e1-zoom        # the go2rtc stream name
+      user: admin             # always set these, see below
+      password: admin
 ```
 
-The user and password Frigate sends are ignored. Home Assistant's ONVIF integration pointed at go2rtc gets the same PTZ.
+Always set `user` and `password`: Frigate's ONVIF library fails with "bad argument type: NoneType(None)" when no `user` is set. With
+an `api: username/password` on go2rtc they must be that username and password (from another machine they are required; from
+`127.0.0.1` they are not checked, unless `local_auth: true`). Without an API username any value works, they are ignored. Home Assistant's ONVIF integration pointed at go2rtc gets the same PTZ.
 
 - **Move**: pan/tilt in eight directions, speed from how far the ONVIF velocity goes (1 to 64 on the camera), and zoom. Zoom is continuous
   where the camera supports it (the lens runs at its own speed until Stop or the end of the range). A camera that refuses that gets
@@ -166,12 +170,13 @@ The user and password Frigate sends are ignored. Home Assistant's ONVIF integrat
   asks for `GetCapabilities` or `GetServices` (nothing logs in at start), and a client's first `GetProfiles` waits up to 8 seconds for those that have not answered; a camera that is offline has
   no PTZ in the answers until it is reachable again, it is retried after 30 seconds, then less often (up to 5 minutes), and its
   other profile data is unaffected. A stream with several sources uses its first `bc://` one.
-- **Access**: the ONVIF server ignores the ONVIF user and password, the cameras are moved with the credentials of the `bc://` URL.
-  Without an API password, whoever can reach port 1984 can move the cameras (as they can already watch them), so keep it on a
-  trusted network. With `api: username/password` set, every path on port 1984 including `/onvif/` needs HTTP Basic auth, except
-  requests from `127.0.0.1` (unless `local_auth: true`). Frigate's bundled go2rtc is reached over `127.0.0.1` and keeps PTZ.
-  ONVIF clients on other machines, such as Home Assistant's ONVIF integration, usually don't send HTTP Basic auth and are then
-  refused.
+- **Access**: the cameras are moved with the credentials of the `bc://` URL; the ONVIF user and password of the client are not
+  passed on. Without an API username, whoever can reach port 1984 can move the cameras (as they can already watch them), so keep it
+  on a trusted network. With `api: username/password` set, the ONVIF server asks for those same credentials, as a WS-Security
+  `UsernameToken` (what Frigate and Home Assistant send) or HTTP Basic, except for requests from `127.0.0.1` (unless
+  `local_auth: true`). The calls clients make before logging in (`GetCapabilities` and a few others) are answered without credentials,
+  but they do not make go2rtc log in to a camera. Frigate's bundled go2rtc is reached over `127.0.0.1` and needs no credentials. See
+  [ONVIF](../onvif/README.md).
 
 When a command fails, the client gets an ONVIF fault with a general text ("camera not reachable"); the details are in go2rtc's
 `onvif` log at `debug`.

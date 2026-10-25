@@ -1,11 +1,13 @@
 package onvif
 
 import (
+	"crypto/subtle"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +26,8 @@ func Init() {
 
 	streams.HandleFunc("onvif", streamOnvif)
 
-	// ONVIF server on all suburls
+	// ONVIF server on all suburls, clients send WS-Security instead of HTTP Basic
+	api.OwnAuth("/onvif/")
 	api.HandleFunc("/onvif/", onvifDeviceService)
 
 	// ONVIF client autodiscovery
@@ -32,6 +35,55 @@ func Init() {
 }
 
 var log zerolog.Logger
+
+// apiAuth is the credentials of the API, to be replaced in tests.
+var apiAuth = api.Auth
+
+// preAuth are the operations answered without credentials (ONVIF Core,
+// access class PRE_AUTH). Not on the PTZ service.
+var preAuth = map[string]bool{
+	onvif.DeviceGetSystemDateAndTime:    true,
+	onvif.DeviceGetCapabilities:         true,
+	onvif.DeviceGetServices:             true,
+	onvif.ServiceGetServiceCapabilities: true,
+	onvif.DeviceGetHostname:             true,
+}
+
+var (
+	reHeader     = regexp.MustCompile(`(?s)<(?:[\w.-]+:)?Header\b[^>]*>.*?</(?:[\w.-]+:)?Header\s*>`)
+	reCredential = regexp.MustCompile(`(?is)<(?:[\w.-]+:)?UsernameToken\b.*?</(?:[\w.-]+:)?UsernameToken\s*>`)
+	reSecret     = regexp.MustCompile(`(?i)password|nonce|usernametoken`)
+)
+
+// redact is a request without the SOAP header, which holds the credentials,
+// for the log. A secret that is left anyway (a token outside of the header,
+// in a comment, in a broken document) removes the whole body.
+func redact(b []byte) []byte {
+	b = reHeader.ReplaceAll(b, []byte("<Header redacted/>"))
+	b = reCredential.ReplaceAll(b, []byte("<redacted/>"))
+	if reSecret.Match(b) {
+		return []byte("<body redacted/>")
+	}
+	return b
+}
+
+// authorized is true if the request needs no credentials or has them, as
+// HTTP Basic or as a WS-Security UsernameToken, for the user and password of
+// the API.
+func authorized(r *http.Request, b []byte) bool {
+	user, pass, localAuth := apiAuth()
+	if user == "" || (!localAuth && api.IsLoopback(r.RemoteAddr)) {
+		return true
+	}
+
+	if u, p, ok := r.BasicAuth(); ok &&
+		subtle.ConstantTimeCompare([]byte(u), []byte(user)) == 1 &&
+		subtle.ConstantTimeCompare([]byte(p), []byte(pass)) == 1 {
+		return true
+	}
+
+	return onvif.CheckUsernameToken(b, user, pass, time.Now())
+}
 
 func streamOnvif(rawURL string) (core.Producer, error) {
 	client, err := onvif.NewClient(rawURL)
@@ -71,9 +123,20 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Trace().Msgf("[onvif] server request %s %s:\n%s", r.Method, r.RequestURI, b)
+	if l := log.Trace(); l.Enabled() {
+		l.Msgf("[onvif] server request %s %s:\n%s", r.Method, r.RequestURI, redact(b))
+	}
 
-	if r.URL.Path == onvif.PathPTZ {
+	isPTZ := r.URL.Path == onvif.PathPTZ
+
+	authed := authorized(r, b)
+	if !authed && (isPTZ || !preAuth[operation]) {
+		log.Debug().Msgf("[onvif] not authorized remote=%s operation=%s", r.RemoteAddr, operation)
+		writeSOAP(w, http.StatusBadRequest, onvif.SenderFaultResponse("NotAuthorized", "Sender not authorized"))
+		return
+	}
+
+	if isPTZ {
 		ptzService(w, r, operation, b)
 		return
 	}
@@ -101,11 +164,15 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
 	case onvif.DeviceGetCapabilities:
 		// important for Hass: Media section
 		b = onvif.GetCapabilitiesResponse(r.Host, hasBCStreams())
-		warmPTZ()
+		if authed {
+			warmPTZ()
+		}
 
 	case onvif.DeviceGetServices:
 		b = onvif.GetServicesResponse(r.Host, hasBCStreams())
-		warmPTZ()
+		if authed {
+			warmPTZ()
+		}
 
 	case onvif.DeviceGetDeviceInformation:
 		// important for Hass: SerialNumber (unique server ID)
@@ -158,7 +225,9 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unsupported operation", http.StatusBadRequest)
 		log.Warn().Msgf("[onvif] unsupported operation: %s", operation)
-		log.Debug().Msgf("[onvif] unsupported request:\n%s", b)
+		if l := log.Debug(); l.Enabled() {
+			l.Msgf("[onvif] unsupported request:\n%s", redact(b))
+		}
 		return
 	}
 

@@ -185,7 +185,17 @@ func escape(s string) string {
 // FaultResponse is a SOAP 1.2 fault from the receiver with an ONVIF subcode
 // (ter:NoProfile, ter:NoToken...). Callers send it with HTTP 500.
 func FaultResponse(subcode, reason string) []byte {
-	return []byte(`<?xml version="1.0" encoding="utf-8"?><env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope" xmlns:ter="` + nsError + `"><env:Body><env:Fault><env:Code><env:Value>env:Receiver</env:Value><env:Subcode><env:Value>ter:` +
+	return fault("env:Receiver", subcode, reason)
+}
+
+// SenderFaultResponse is a SOAP 1.2 fault from the sender, such as
+// ter:NotAuthorized. Callers send it with HTTP 400.
+func SenderFaultResponse(subcode, reason string) []byte {
+	return fault("env:Sender", subcode, reason)
+}
+
+func fault(code, subcode, reason string) []byte {
+	return []byte(`<?xml version="1.0" encoding="utf-8"?><env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope" xmlns:ter="` + nsError + `"><env:Body><env:Fault><env:Code><env:Value>` + code + `</env:Value><env:Subcode><env:Value>ter:` +
 		escape(subcode) + `</env:Value></env:Subcode></env:Code><env:Reason><env:Text xml:lang="en">` +
 		escape(reason) + `</env:Text></env:Reason></env:Fault></env:Body></env:Envelope>`)
 }

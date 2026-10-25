@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -66,6 +67,7 @@ func Init() {
 	}
 
 	if cfg.Mod.Username != "" {
+		authUser, authPass, authLocal = cfg.Mod.Username, cfg.Mod.Password, cfg.Mod.LocalAuth
 		Handler = middlewareAuth(cfg.Mod.Username, cfg.Mod.Password, cfg.Mod.LocalAuth, Handler) // 2nd
 	}
 
@@ -205,13 +207,75 @@ func middlewareLog(next http.Handler) http.Handler {
 	})
 }
 
-func isLoopback(remoteAddr string) bool {
+// IsLoopback reports whether the RemoteAddr of a request is this machine.
+func IsLoopback(remoteAddr string) bool {
 	return strings.HasPrefix(remoteAddr, "127.") || strings.HasPrefix(remoteAddr, "[::1]") || remoteAddr == "@"
+}
+
+var (
+	authUser, authPass string
+	authLocal          bool
+	ownAuth            []string // patterns of handlers that check the credentials themselves
+	ownAuthMu          sync.RWMutex
+)
+
+// Auth returns the credentials of the API. The username is empty if the API
+// has no authentication. With localAuth false, requests from this machine
+// need no credentials.
+func Auth() (username, password string, localAuth bool) {
+	return authUser, authPass, authLocal
+}
+
+// OwnAuth leaves the handler registered with exactly this pattern (as given
+// to http.HandleFunc, "/onvif/") to the module that registered it: the HTTP
+// Basic check of the API does not apply to the requests it serves, so the
+// module must check the credentials itself, see Auth. More specific patterns
+// under it, and everything else, keep the check.
+func OwnAuth(pattern string) {
+	ownAuthMu.Lock()
+	ownAuth = append(ownAuth, pattern)
+	ownAuthMu.Unlock()
+}
+
+// hasOwnAuth is true if the mux serves the request with a handler that
+// checks the credentials itself. The mux decides, not the path of the
+// request: it matches the escaped path, and a more specific pattern wins.
+func hasOwnAuth(r *http.Request) bool {
+	ownAuthMu.RLock()
+	registered := slices.Clone(ownAuth)
+	ownAuthMu.RUnlock()
+
+	if len(registered) == 0 {
+		return false
+	}
+	// the mux answers an unclean path with a redirect, that is not the handler
+	if p := r.URL.Path; p != "" && p != cleanPath(p) {
+		return false
+	}
+	_, pattern := http.DefaultServeMux.Handler(r)
+	// "/onvif" is redirected to "/onvif/" and has the pattern of its target
+	if strings.TrimSuffix(pattern, "/") == r.URL.Path {
+		return false
+	}
+	return slices.Contains(registered, pattern)
+}
+
+func cleanPath(p string) string {
+	c := path.Clean(p)
+	if c != "/" && p[len(p)-1] == '/' {
+		c += "/"
+	}
+	return c
 }
 
 func middlewareAuth(username, password string, localAuth bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if localAuth || !isLoopback(r.RemoteAddr) {
+		if hasOwnAuth(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if localAuth || !IsLoopback(r.RemoteAddr) {
 			user, pass, ok := r.BasicAuth()
 			if !ok || user != username || pass != password {
 				w.Header().Set("Www-Authenticate", `Basic realm="go2rtc"`)
