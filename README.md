@@ -3,22 +3,6 @@
     <img src="./website/images/logo.gif" alt="go2rtc - GitHub">
   </a>
 </h1>
-<p align="center">
-  <a href="https://github.com/AlexxIT/go2rtc/stargazers" target="_blank">
-    <img style="display: inline" src="https://img.shields.io/github/stars/AlexxIT/go2rtc?style=flat-square&logo=github" alt="go2rtc - GitHub Stars">
-  </a>
-  <a href="https://hub.docker.com/r/alexxit/go2rtc" target="_blank">
-    <img style="display: inline" src="https://img.shields.io/docker/pulls/alexxit/go2rtc?style=flat-square&logo=docker&logoColor=white&label=pulls" alt="go2rtc - Docker Pulls">
-  </a>
-  <a href="https://github.com/AlexxIT/go2rtc/releases" target="_blank">
-    <img style="display: inline" src="https://img.shields.io/github/downloads/AlexxIT/go2rtc/total?color=blue&style=flat-square&logo=github" alt="go2rtc - GitHub Downloads">
-  </a>
-</p>
-<p align="center">
-  <a href="https://trendshift.io/repositories/4628" target="_blank">
-    <img src="https://trendshift.io/api/badge/repositories/4628" alt="go2rtc - Trendshift"/>
-  </a>
-</p>
 
 Ultimate camera streaming application with support for dozens formats and protocols.
 
