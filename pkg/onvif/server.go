@@ -55,7 +55,12 @@ func GetRequestAction(b []byte) string {
 	return string(m[1])
 }
 
-func GetCapabilitiesResponse(host string) []byte {
+func GetCapabilitiesResponse(host string, ptz bool) []byte {
+	ptzXAddr := ""
+	if ptz {
+		ptzXAddr = "\n\t\t<tt:PTZ>\n\t\t\t<tt:XAddr>http://" + host + PathPTZ + "</tt:XAddr>\n\t\t</tt:PTZ>"
+	}
+
 	e := NewEnvelope()
 	e.Appendf(`<tds:GetCapabilitiesResponse>
 	<tds:Capabilities>
@@ -69,13 +74,18 @@ func GetCapabilitiesResponse(host string) []byte {
 				<tt:RTP_TCP>false</tt:RTP_TCP>
 				<tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP>
 			</tt:StreamingCapabilities>
-		</tt:Media>
+		</tt:Media>%s
 	</tds:Capabilities>
-</tds:GetCapabilitiesResponse>`, host, host)
+</tds:GetCapabilitiesResponse>`, host, host, ptzXAddr)
 	return e.Bytes()
 }
 
-func GetServicesResponse(host string) []byte {
+func GetServicesResponse(host string, ptz bool) []byte {
+	ptzService := ""
+	if ptz {
+		ptzService = "\n\t<tds:Service>\n\t\t<tds:Namespace>" + nsPTZ + "</tds:Namespace>\n\t\t<tds:XAddr>http://" + host + PathPTZ + "</tds:XAddr>\n\t\t<tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version>\n\t</tds:Service>"
+	}
+
 	e := NewEnvelope()
 	e.Appendf(`<tds:GetServicesResponse>
 	<tds:Service>
@@ -87,8 +97,8 @@ func GetServicesResponse(host string) []byte {
 		<tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace>
 		<tds:XAddr>http://%s/onvif/media_service</tds:XAddr>
 		<tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version>
-	</tds:Service>
-</tds:GetServicesResponse>`, host, host)
+	</tds:Service>%s
+</tds:GetServicesResponse>`, host, host, ptzService)
 	return e.Bytes()
 }
 
@@ -133,30 +143,39 @@ func GetDeviceInformationResponse(manuf, model, firmware, serial string) []byte 
 	return e.Bytes()
 }
 
-func GetProfilesResponse(names []string) []byte {
+// GetProfilesResponse lists a profile per name, the ones in ptz also carry a
+// PTZConfiguration (if they have any feature).
+func GetProfilesResponse(names []string, ptz map[string]PTZFeatures) []byte {
 	e := NewEnvelope()
 	e.Append(`<trt:GetProfilesResponse>`)
 	for _, name := range names {
-		appendProfile(e, "Profiles", name)
+		var f *PTZFeatures
+		if v, ok := ptz[name]; ok {
+			f = &v
+		}
+		appendProfile(e, "Profiles", name, f)
 	}
 	e.Append(`</trt:GetProfilesResponse>`)
 	return e.Bytes()
 }
 
-func GetProfileResponse(name string) []byte {
+func GetProfileResponse(name string, ptz *PTZFeatures) []byte {
 	e := NewEnvelope()
 	e.Append(`<trt:GetProfileResponse>`)
-	appendProfile(e, "Profile", name)
+	appendProfile(e, "Profile", name, ptz)
 	e.Append(`</trt:GetProfileResponse>`)
 	return e.Bytes()
 }
 
-func appendProfile(e *Envelope, tag, name string) {
+func appendProfile(e *Envelope, tag, name string, ptz *PTZFeatures) {
 	// go2rtc name = ONVIF Profile Name = ONVIF Profile token
 	e.Appendf(`<trt:%s token="%s" fixed="true">`, tag, name)
 	e.Appendf(`<tt:Name>%s</tt:Name>`, name)
 	appendVideoSourceConfiguration(e, "VideoSourceConfiguration", name)
 	appendVideoEncoderConfiguration(e, "VideoEncoderConfiguration")
+	if ptz != nil && (ptz.PanTilt || ptz.Zoom) {
+		appendPTZConfiguration(e, "tt:PTZConfiguration", name, *ptz)
+	}
 	e.Appendf(`</trt:%s>`, tag)
 }
 

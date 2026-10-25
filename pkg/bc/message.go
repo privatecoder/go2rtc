@@ -25,6 +25,8 @@ const (
 	MsgLogout       = 2
 	MsgVideo        = 3
 	MsgVideoStop    = 4
+	MsgPTZControl   = 18
+	MsgPTZPreset    = 19
 	MsgTalkAbility  = 10
 	MsgTalkReset    = 11
 	MsgGetEnc       = 56
@@ -32,9 +34,13 @@ const (
 	MsgPing         = 93
 	MsgUID          = 114
 	MsgStreamInfo   = 146
+	MsgGetPTZPreset = 190
+	MsgGetSupport   = 199
 	MsgTalkConfig   = 201
 	MsgTalk         = 202
 	MsgUDPKeepAlive = 234
+	MsgGetZoomFocus = 294
+	MsgSetZoomFocus = 295
 )
 
 // Header classes. Only 0x6414 and 0x0000 have the extra payload_offset word.

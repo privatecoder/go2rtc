@@ -21,6 +21,23 @@ A regular camera has a single video source (`GetVideoSources`) and two profiles 
 
 Go2rtc has one video source and one profile per stream.
 
+### PTZ
+
+[`bc://` streams](../bc/README.md#ptz-frigate-home-assistant) of cameras with pan/tilt or zoom get a PTZ service at `/onvif/ptz_service`.
+It is advertised in `GetCapabilities` and `GetServices` only if a `bc://` stream exists, so other installs answer as before. A profile
+has a `PTZConfiguration` only if its stream's first `bc://` source is a camera that can move; the profile token is the stream name.
+
+| operation                                                   | answer                                                              |
+|-------------------------------------------------------------|---------------------------------------------------------------------|
+| `GetServiceCapabilities`, `GetConfigurations`, `GetConfiguration`, `GetConfigurationOptions`, `GetNodes`, `GetNode` | continuous pan/tilt and zoom velocity only |
+| `ContinuousMove` (optional `Timeout`), `Stop`               | move and stop, a move without `Stop` ends after 10 seconds at most  |
+| `GetPresets`, `GotoPreset`, `SetPreset`                     | the camera's presets, tokens are its preset numbers                 |
+| `RemovePreset`, `GetStatus`, `AbsoluteMove`, `RelativeMove` and everything else | SOAP fault `ter:ActionNotSupported`                  |
+
+Faults are SOAP 1.2 with HTTP status 500: `ter:NoProfile` (no such stream, or it has no `bc://` source), `ter:NoToken` (not a preset
+number), `ter:NoConfig` and `ter:NoEntity` (unknown configuration or node), `ter:InvalidArgVal` (bad velocity, timeout or flag), and
+`ter:Action` with the text "camera not reachable" when the camera does not take the command. No authentication, as for the rest of the server.
+
 ## Tested clients
 
 Go2rtc works as ONVIF server:

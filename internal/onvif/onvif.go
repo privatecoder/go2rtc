@@ -66,12 +66,17 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
 	}
 
 	operation := onvif.GetRequestAction(b)
-	if operation == "" {
+	if operation == "" && r.URL.Path != onvif.PathPTZ {
 		http.Error(w, "malformed request body", http.StatusBadRequest)
 		return
 	}
 
 	log.Trace().Msgf("[onvif] server request %s %s:\n%s", r.Method, r.RequestURI, b)
+
+	if r.URL.Path == onvif.PathPTZ {
+		ptzService(w, r, operation, b)
+		return
+	}
 
 	switch operation {
 	case onvif.ServiceGetServiceCapabilities, // important for Hass
@@ -95,10 +100,12 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
 
 	case onvif.DeviceGetCapabilities:
 		// important for Hass: Media section
-		b = onvif.GetCapabilitiesResponse(r.Host)
+		b = onvif.GetCapabilitiesResponse(r.Host, hasBCStreams())
+		warmPTZ()
 
 	case onvif.DeviceGetServices:
-		b = onvif.GetServicesResponse(r.Host)
+		b = onvif.GetServicesResponse(r.Host, hasBCStreams())
+		warmPTZ()
 
 	case onvif.DeviceGetDeviceInformation:
 		// important for Hass: SerialNumber (unique server ID)
@@ -116,11 +123,16 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
 
 	case onvif.MediaGetProfiles:
 		// important for Hass: H264 codec, width, height
-		b = onvif.GetProfilesResponse(streams.GetAllNames())
+		names := streams.GetAllNames()
+		b = onvif.GetProfilesResponse(names, ptzFeatures(names, profilesWait))
 
 	case onvif.MediaGetProfile:
 		token := onvif.FindTagValue(b, "ProfileToken")
-		b = onvif.GetProfileResponse(token)
+		var ptz *onvif.PTZFeatures
+		if f, ok := ptzFeatures([]string{token}, profilesWait)[token]; ok {
+			ptz = &f
+		}
+		b = onvif.GetProfileResponse(token, ptz)
 
 	case onvif.MediaGetVideoSourceConfigurations:
 		// important for Happytime Onvif Client

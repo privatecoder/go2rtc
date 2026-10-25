@@ -129,6 +129,49 @@ shows `Using go2rtc binary from '/config/go2rtc'`.
 Home Assistant (WebRTC camera, Frigate integration or go2rtc's own card) uses the same stream names. Define each stream once in go2rtc and let every
 consumer read it from there, so the camera sees a single connection per stream.
 
+## PTZ (Frigate, Home Assistant)
+
+go2rtc's ONVIF server offers pan, tilt, zoom and presets for `bc://` streams of cameras that have them, and turns the ONVIF calls into
+Baichuan messages. Frigate and Home Assistant only speak ONVIF for PTZ, so they point at go2rtc instead of the camera, which
+can keep its own ONVIF and RTSP switched off. The profile is the go2rtc stream name:
+
+```yaml
+# Frigate config.yml
+cameras:
+  e1-zoom:
+    onvif:
+      host: 127.0.0.1         # go2rtc, here inside the Frigate container
+      port: 1984              # go2rtc's API port
+      profile: e1-zoom        # the go2rtc stream name
+```
+
+The user and password Frigate sends are ignored. Home Assistant's ONVIF integration pointed at go2rtc gets the same PTZ.
+
+- **Move**: pan/tilt in eight directions, speed from how far the ONVIF velocity goes (1 to 64 on the camera), and zoom. Zoom is continuous
+  where the camera supports it (the lens runs at its own speed until Stop or the end of the range). A camera that refuses that gets
+  stepped zoom instead (every 200 ms, about a twentieth of the range per step at full speed), as does a move that pans or tilts and
+  zooms at once.
+- **Stop is not left to chance**: a move without a Stop ends by itself after 10 seconds, or after the ONVIF `Timeout` of the
+  request if that is shorter. A Stop the camera does not acknowledge is sent again (for up to a minute).
+- **Presets**: the camera's presets are listed and can be gone to. `SetPreset` saves the current position, in the slot the client names
+  or in the lowest free one of 0 to 63; presets can also be made in the Reolink app. Preset tokens are the camera's preset numbers.
+  `RemovePreset` is not supported.
+- **No autotracking**: only continuous movement is offered, no relative or absolute moves and no position status, so Frigate shows
+  autotracking as unsupported.
+- **The same for IP and UID cameras.** PTZ commands go over the session of a running stream of the camera (the main stream, or the
+  `sub` stream of the same camera, whichever is up) and do not touch the video. Only when no stream of that camera is running
+  go2rtc opens a session of its own for PTZ, with the same URL and discovery, and closes it after a minute without use.
+- **Where PTZ shows up**: the PTZ service is advertised only if at least one `bc://` stream is configured, and a profile gets
+  PTZ only if the camera reports pan/tilt or zoom (the zoom controls only if it has a zoom lens). go2rtc asks the cameras when an ONVIF client first
+  asks for `GetCapabilities` or `GetServices` (nothing logs in at start), and a client's first `GetProfiles` waits up to 8 seconds for those that have not answered; a camera that is offline has
+  no PTZ in the answers until it is reachable again, it is retried after 30 seconds, then less often (up to 5 minutes), and its
+  other profile data is unaffected. A stream with several sources uses its first `bc://` one.
+- **No authentication**: go2rtc's ONVIF server accepts any request, whoever can reach port 1984 can move the cameras. Keep it on a
+  trusted network.
+
+When a command fails, the client gets an ONVIF fault with a general text ("camera not reachable"); the details are in go2rtc's
+`onvif` log at `debug`.
+
 ## Two-way audio
 
 Cameras that report a talk format get a backchannel (PCMA or PCMU, 8000 Hz) that browsers and Home Assistant use through WebRTC. The audio
@@ -156,7 +199,8 @@ to the camera in every acknowledgement, which is what lets the camera send its f
   own repacker that starts every consumer at zero.
 - Log levels: discovery steps are `debug`, the chosen path and the login (with camera type and resolution) are `info`, drops, retries,
   format changes and errors are `warn`; every line starts with the UID or host.
-- Not supported: PTZ, motion events, SD card playback and other camera settings.
+- Not supported: motion events, SD card playback, PTZ calibration, focus, patrols and other camera settings. PTZ is available through
+  the ONVIF server, see above.
 
 ## Troubleshooting
 

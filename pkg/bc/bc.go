@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"regexp"
 	"time"
@@ -31,21 +32,37 @@ func Dial(rawURL string) (core.Producer, error) {
 
 // dial is Dial with a hook to change the discovery options, for tests.
 func dial(rawURL string, tune func(*udp.Options)) (core.Producer, error) {
-	u, err := url.Parse(rawURL)
+	conn, cfg, kind, protocol, err := connect(rawURL, tune)
 	if err != nil {
 		return nil, err
+	}
+
+	prod, err := NewProducer(conn, cfg, kind, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	prod.Protocol = protocol
+	return prod, nil
+}
+
+// connect parses a bc:// source and opens the transport to the camera (TCP, or
+// P2P discovery for a UID), protocol is "tcp" or "udp". Nothing is sent yet.
+func connect(rawURL string, tune func(*udp.Options)) (conn io.ReadWriteCloser, cfg Config, kind StreamKind, protocol string, err error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, cfg, 0, "", err
 	}
 
 	query := u.Query()
 
 	kind, ok := ParseStreamKind(query.Get("stream"))
 	if !ok {
-		return nil, errors.New("bc: unknown stream " + query.Get("stream") + ", use main, sub or extern")
+		return nil, cfg, 0, "", errors.New("bc: unknown stream " + query.Get("stream") + ", use main, sub or extern")
 	}
 
 	enc, ok := ParseMaxEncryption(query.Get("encryption"))
 	if !ok {
-		return nil, errors.New("bc: unknown encryption " + query.Get("encryption") + ", use aes, bc or none")
+		return nil, cfg, 0, "", errors.New("bc: unknown encryption " + query.Get("encryption") + ", use aes, bc or none")
 	}
 
 	var channel uint8
@@ -54,12 +71,12 @@ func dial(rawURL string, tune func(*udp.Options)) (core.Producer, error) {
 	}
 
 	password, _ := u.User.Password()
-	cfg := Config{Username: u.User.Username(), Password: password, Channel: channel, Encryption: enc, Name: u.Hostname()}
+	cfg = Config{Username: u.User.Username(), Password: password, Channel: channel, Encryption: enc, Name: u.Hostname()}
 
 	if u.Port() == "" && reUID.MatchString(u.Hostname()) {
 		method, ok := udp.ParseMethod(query.Get("discovery"))
 		if !ok {
-			return nil, errors.New("bc: unknown discovery " + query.Get("discovery") + ", use local, remote, map or relay")
+			return nil, cfg, 0, "", errors.New("bc: unknown discovery " + query.Get("discovery") + ", use local, remote, map or relay")
 		}
 
 		opts := udp.Options{
@@ -79,27 +96,16 @@ func dial(rawURL string, tune func(*udp.Options)) (core.Producer, error) {
 		if err != nil {
 			var cd *udp.CooldownError
 			if errors.As(err, &cd) {
-				return nil, fmt.Errorf("bc: waiting for P2P cooldown, retry in %ds", int(cd.Wait.Round(time.Second)/time.Second))
+				return nil, cfg, 0, "", fmt.Errorf("bc: waiting for P2P cooldown, retry in %ds", int(cd.Wait.Round(time.Second)/time.Second))
 			}
-			return nil, err
+			return nil, cfg, 0, "", err
 		}
-
-		prod, err := NewProducer(conn, cfg, kind, rawURL)
-		if err != nil {
-			return nil, err
-		}
-		prod.Protocol = "udp"
-		return prod, nil
+		return conn, cfg, kind, "udp", nil
 	}
 
-	conn, err := DialTCP(u.Host)
+	tcp, err := DialTCP(u.Host)
 	if err != nil {
-		return nil, err
+		return nil, cfg, 0, "", err
 	}
-
-	prod, err := NewProducer(conn, cfg, kind, rawURL)
-	if err != nil {
-		return nil, err
-	}
-	return prod, nil
+	return tcp, cfg, kind, "tcp", nil
 }

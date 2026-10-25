@@ -158,6 +158,9 @@ func NewProducer(conn io.ReadWriteCloser, cfg Config, kind StreamKind, source st
 	if talkCfg != nil {
 		p.Medias = append(p.Medias, talkMedia())
 	}
+	if key, err := CameraKey(source); err == nil {
+		registerClient(key, client)
+	}
 	return p, nil
 }
 
