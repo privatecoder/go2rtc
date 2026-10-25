@@ -36,7 +36,26 @@ has a `PTZConfiguration` only if its stream's first `bc://` source is a camera t
 
 Faults are SOAP 1.2 with HTTP status 500: `ter:NoProfile` (no such stream, or it has no `bc://` source), `ter:NoToken` (not a preset
 number), `ter:NoConfig` and `ter:NoEntity` (unknown configuration or node), `ter:InvalidArgVal` (bad velocity, timeout or flag), and
-`ter:Action` with the text "camera not reachable" when the camera does not take the command. No authentication, as for the rest of the server.
+`ter:Action` with the text "camera not reachable" when the camera does not take the command.
+
+### Authentication
+
+Without `api: username` the ONVIF server has no authentication, as before. With `api: username/password` set, the ONVIF user and password are the
+API username and password, and `/onvif/` no longer uses the HTTP Basic check of the other paths (every other path keeps it, including any path the web UI is
+moved to below `/onvif/` with `base_path`). A request is
+accepted with
+
+- a WS-Security `UsernameToken` in the SOAP header (`Envelope > Header > Security`, one token, user and password compared exactly), as ONVIF clients send it (Frigate, Home Assistant): `PasswordDigest` (with a
+  `Created` time within 5 minutes of the server's clock) or `PasswordText`, or
+- HTTP Basic auth with the same username and password.
+
+Requests from `127.0.0.1` need no credentials, unless `local_auth: true` is set (the same rule as for the API). The credentials are removed from the request before it is written to the log. A request without valid
+credentials gets HTTP 400 and a SOAP fault `env:Sender` / `ter:NotAuthorized` ("Sender not authorized").
+
+`GetSystemDateAndTime`, `GetCapabilities`, `GetServices`, `GetServiceCapabilities` and `GetHostname` of the device and media services
+are answered without credentials, as the ONVIF specification asks, because clients call them before they log in. Everything else, and
+every request to the PTZ service, needs them. A nonce is not remembered, so a captured request can be replayed for 5 minutes; use it
+on a trusted network, or over HTTPS (`api: tls_listen`).
 
 ## Tested clients
 
